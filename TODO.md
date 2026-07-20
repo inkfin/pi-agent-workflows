@@ -71,32 +71,34 @@
 ## Phase 2：Project Tree（本地开发树）
 
 ### 2.1 数据模型
-- [ ] `extensions/project-tree/state.ts` — ProjectTree / Branch 类型定义
-- [ ] `.pi/tree/state.json` 读写（项目级）
+- [x] `extensions/project-tree/state.ts` — ProjectTree / Branch 类型定义
+- [x] `.pi/tree/state.json` 读写（项目级）
 - [ ] 从现有 session 文件反向构建初始 tree（迁移脚本）
 
 ### 2.2 分支命令
-- [ ] `/branch` — 打开 tree 主视图（tig 风格交互 UI）
-- [ ] `/branch create <name> [desc]` — 从当前位置创建新分支
-- [ ] `/branch switch <name>` — 切换到已有分支
-- [ ] `/branch rename <name>` — 重命名当前分支
-- [ ] `/branch archive [name]` — 归档分支
+- [x] `/branch` — 打开 tree 主视图（tig 风格交互 UI）
+- [x] `/branch create <name> [desc]` — 从当前位置创建新分支
+- [x] `/branch switch <name>` — 切换到已有分支
+- [x] `/branch rename <name>` — 重命名当前分支
+- [x] `/branch archive [name]` — 归档分支
+- [x] `/branch list` — 非交互式列表
 
 ### 2.3 Tree View UI（重点打磨）
-- [ ] 主视图：分支树 + 摘要信息
-  - [ ] ● / ○ 区分本地/远程分支
-  - [ ] 🟡 标记未同步分支
-  - [ ] 每个分支显示 message 数量、最后活跃时间、描述
-- [ ] 展开/收起分支（Enter）
-- [ ] 分支详情面板：消息列表、涉及文件
-- [ ] j/k 导航、s 切换、m merge、d discard 快捷键
+- [x] 主视图：分支树 + 摘要信息
+  - [x] ● / ○ 区分本地/远程分支
+  - [x] 每个分支显示 message 数量、最后活跃时间、描述
+- [x] 展开/收起分支（Enter）
+- [x] 分支详情面板：消息列表、涉及文件
+- [x] j/k 导航、s 切换、m merge、c create、a archive、r rename 快捷键
+- [x] 树形绘制（├── └── │）
+- [ ] 🟡 标记未同步分支（Phase 3）
 - [ ] 标题栏状态指示器
 
 ### 2.4 分支合并
-- [ ] `merge.ts` — 合并策略
-  - [ ] Context inject：把另一分支的摘要注入当前对话
-  - [ ] Full switch：直接切换到目标分支
-- [ ] `/branch merge <name>` 命令
+- [x] `mergeBranchIntoCurrent()` — context-inject 合并策略
+- [x] 在 tree view 中按 m 触发合并
+- [x] 将源分支摘要注入当前对话
+- [ ] Full switch 合并策略（= /branch switch 已覆盖）
 - [ ] merge dialog UI（选择策略）
 
 ### 2.5 将 /fork 重定向

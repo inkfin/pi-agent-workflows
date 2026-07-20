@@ -4,6 +4,6 @@
   "description": "Personal pi agent workflow: commands, project tree, and session sync",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": [".pi/extensions/commands"]
+    "extensions": [".pi/extensions/commands", ".pi/extensions/project-tree"]
   }
 }
