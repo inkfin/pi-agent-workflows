@@ -312,7 +312,6 @@ export function setupBranchCommands(pi: ExtensionAPI) {
             (tui, theme, _kb, done) => {
               const view = new TreeView(tree, currentSessionFile, theme);
               view.setResolve((r) => done(r));
-              tui.on("resize", () => view.invalidate());
               return view;
             },
           );
