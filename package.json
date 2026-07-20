@@ -2,8 +2,19 @@
   "name": "pi-agent-workflow",
   "version": "0.1.0",
   "description": "Personal pi agent workflow: commands, project tree, and session sync",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "test": "node tests/grove-e2e.mjs"
+  },
   "pi": {
-    "extensions": [".pi/extensions/commands", ".pi/extensions/project-tree"]
+    "extensions": [
+      ".pi/extensions/commands",
+      ".pi/extensions/grove"
+    ]
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
   }
 }

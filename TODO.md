@@ -68,100 +68,94 @@
 
 ---
 
-## Phase 2：Project Tree（本地开发树）
+## Phase 2：Grove — 本地 session 树（jj-backed）
 
-### 2.1 数据模型
-- [x] `extensions/project-tree/state.ts` — ProjectTree / Branch 类型定义
-- [x] `.pi/tree/state.json` 读写（项目级）
-- [ ] 从现有 session 文件反向构建初始 tree（迁移脚本）
+> 架构决策见 docs/adr/0001（TS 编排 + jj CLI + git-backed）。
+> 术语见 CONTEXT.md（Node / Checkpoint / Tree Repo / Session Snapshot）。
 
-### 2.2 分支命令
-- [x] `/branch` — 打开 tree 主视图（tig 风格交互 UI）
-- [x] `/branch create <name> [desc]` — 从当前位置创建新分支
-- [x] `/branch switch <name>` — 切换到已有分支
-- [x] `/branch rename <name>` — 重命名当前分支
-- [x] `/branch archive [name]` — 归档分支
-- [x] `/branch list` — 非交互式列表
+> **交接快照（2026-07-20）**
+> - **状态**：v1 骨架完成并验证。backend（jj-cli）/ 映射层 / `/grove` 全子命令 / 交互 UI 均可用。
+> - **验证**：`npm test`（14 项 e2e+单元检查，需 jj on PATH）。dogfood：本项目跑 `pi`，`/grove commit "..."` → `/grove` 树视图 → `s` goto → `u` undo。
+> - **下一步入口**：2.5 加固（dogfood 迭代优先）→ Phase 3 registry。
+> - **已知的坑（勿复踩）**：
+>   1. jj 模板 `description` 自带尾换行——取数必须 `description.first_line()`（单行 JSON manifest）
+>   2. `ctx.switchSession`/`ctx.fork` 后旧 `ctx` 即失效——错误上报须提前快照 `ctx.ui.notify`；`withSession` 里只用 `replacementCtx`
+>   3. 扩展命令优先于内置命令——不要注册 `/tree`，会屏蔽 pi 内置 undo-tree
+>   4. fork 节点由 `session_start(reason:"fork")` 统一捕获——任何调用方不要再手动登记，否则重复
+>   5. 测试加载 UI/commands 需要 jiti alias 打桩 `@earendil-works/pi-tui`（见 tests/stubs/）
 
-### 2.3 Tree View UI（重点打磨）
-- [x] 主视图：分支树 + 摘要信息
-  - [x] ● / ○ 区分本地/远程分支
-  - [x] 每个分支显示 message 数量、最后活跃时间、描述
-- [x] 展开/收起分支（Enter）
-- [x] 分支详情面板：消息列表、涉及文件
-- [x] j/k 导航、s 切换、m merge、c create、a archive、r rename 快捷键
-- [x] 树形绘制（├── └── │）
-- [ ] 🟡 标记未同步分支（Phase 3）
-- [ ] 标题栏状态指示器
+### 2.1 TreeBackend 接口与 jj 实现
+- [x] `extensions/grove/backend/types.ts` — TreeBackend 接口（init/node/commit/fork/goto/log/undo）
+- [x] `extensions/grove/backend/jj-cli.ts` — shell out 实现（`--no-pager`，\x1f 分隔符取数）
+  - 坑：jj `description` 模板自带尾换行，必须用 `description.first_line()` 取单行 JSON
+- [x] `jj git init` 初始化 `<project>/.pi/tree/`（colocated），root 节点 describe + repo 内 .gitignore
+- [x] 加载时检测 jj 存在与最低版本（`JjCliBackend.checkAvailability`），缺失则 grove 静默
+- [x] 懒初始化：session_start 不为任何项目自动建仓，首个 grove 操作才建仓
 
-### 2.4 分支合并
-- [x] `mergeBranchIntoCurrent()` — context-inject 合并策略
-- [x] 在 tree view 中按 m 触发合并
-- [x] 将源分支摘要注入当前对话
-- [ ] Full switch 合并策略（= /branch switch 已覆盖）
-- [ ] merge dialog UI（选择策略）
+### 2.2 映射层（pi ↔ jj 对齐，TS 编排）
+- [x] manifest = jj commit description 单行 JSON（不建独立 manifest 文件，一次 `jj log` 取全拓扑+元数据）
+- [x] checkpoint：快照当前 session 进 `sessions/<basename>.jsonl` + `jj new` + `jj describe`
+  - 捕获节奏参考 Entire：`agent_end` 落稳定快照，快照缓存目录中转（docs/ref/entire.md）
+- [x] **redaction 管道**：快照进仓库前 secrets 检测打码（v1 naive 模式，待加强）
+- [ ] **compaction 对齐**：pi compact 后 entryId 有效性与快照 offset 处理（Entire 踩过的坑）
+- [x] fork：`ctx.fork(entryId)` + `session_start(reason:"fork")` 统一捕获为 fork 节点
+- [x] goto：同 session `navigateTree` / 跨 session `switchSession`，对齐 `jj edit`；快照缺失时物化
+- [x] 身份：change-id 定 Node、session basename 定 Session、machine-id（XDG config）作 origin、project（git remote/basename）
+- [x] 并发 naive：进程内 op queue 串行（backend enqueue）
+- [ ] fork：`ctx.fork(entryId)` 对齐 `jj new <rev>`，记录 fork 父子
+- [ ] goto：同 session `navigateTree` / 跨 session `switchSession`，对齐 `jj edit`
+- [ ] 身份：change-id 定 Node、uuid 定 Session、machine-id（XDG config）作 origin、projectId（git remote 哈希/basename 兜底 + 本地绑定）
+- [ ] 并发 naive：进程内 op queue 串行；跨进程靠 jj 锁，失败提示重试
 
-### 2.5 将 /fork 重定向
-- [ ] 拦截 pi 原生 `/fork`，引导用户使用 `/branch create`
-- [ ] 或保持兼容，但创建时同时注册为 tree branch
+### 2.3 `/grove` 命令与交互 UI（不屏蔽内置 /tree）
+- [x] `/grove` — jj-log 风格树视图：◆ checkpoint、⑂ fork、⊙ merge、◇ root、@ 当前、origin/dirty 元信息
+- [x] 操作键：Enter 详情、s goto、c commit、f fork、m merge、p pick、u undo、q 关闭
+- [x] 非交互子命令：`commit/goto/fork/status/log/undo/merge/pick`，`sync` 为 Phase 3 占位
+- [x] `/grove status` — @ 位置、当前节点、code dirty 标记
+- [x] undo：包装 `jj undo`（pi 侧逆操作为 best-effort）
+- [x] merge / cherry-pick：context-inject（读源快照摘要 → sendUserMessage），merge 记双父节点
+- [ ] UI 打磨：真实 jj 多列图渲染（当前为缩进树）、折叠、状态栏刷新时机（dogfood 后迭代）
 
----
+### 2.4 清理（已完成）
+- [x] 删除旧 branch 模型实现（`.pi/extensions/project-tree/`）与遗留 `state.json` —— 不做迁移（未对齐，个人项目无历史包袱）
+- [x] backend 改 `--no-colocate`（与 ADR-0001 一致；工作区无内嵌 `.git`）
+- [x] 持久化测试 `tests/grove-e2e.mjs`（`npm test`，14 项检查）
 
-## Phase 3：Sync（基于 Tree 的同步）
-
-### 3.1 Remote 配置
-- [ ] `extensions/sync/transport.ts` — ssh + rsync 传输层
-- [ ] `/sync remote add <name> <host> [path]` — 配置 remote
-- [ ] `/sync remote rm <name>` — 移除 remote
-- [ ] `/sync remote list` — 列出 remotes
-
-### 3.2 Push/Pull
-- [ ] `extensions/sync/tree-sync.ts` — tree 级别同步逻辑
-- [ ] `/sync push [remote]` — 推送本地 tree + sessions
-- [ ] `/sync pull [remote]` — 拉取 remote tree + merge 到本地
-- [ ] 同步点（sync point）机制：记录每个分支的 last-synced-entry-id
-- [ ] /sync status 显示每个分支的同步状态
-
-### 3.3 冲突处理
-- [ ] 同名分支来自两个 source → 冲突标记为需要 resolve
-- [ ] `/sync conflicts` 列出冲突
-- [ ] 冲突处理 UI：
-  - [ ] 保留两个（远程重命名）
-  - [ ] 丢弃远程
-  - [ ] 丢弃本地
-  - [ ] inspect 后决定
-
-### 3.4 状态指示器
-- [ ] 标题栏显示 sync 状态（🟢/🟡/🔴）
-- [ ] branch tree 中标记远程分支来源
+### 2.5 加固（下一阶段入口）
+- [ ] **dogfood 迭代**：在本项目日常使用，收集手感问题
+- [ ] **compaction 对齐**：pi compact 后 entryId 有效性与快照 offset（Entire 踩过的坑，docs/ref/entire.md）
+- [ ] redaction 规则加强（当前仅 sk-/AKIA/ghp_/JWT 四类 naive 模式）
+- [ ] settings 分层：registry 退出等项目级配置应入仓共享，个人偏好走本地（参考 Entire settings.local 分层）
+- [ ] UI 打磨：真实 jj 多列图渲染（当前缩进树）、折叠、status bar 刷新时机
 
 ---
 
-## Phase 4：高级能力（未来）
+## Phase 3：Grove Sync（registry + 跨机 fetch）
 
-### 4.1 跨分支共享状态
-- [ ] Shared Context 数据模型（`shared.json`）
-- [ ] `/branch share "<decision>"` — 提升决策到项目级共享上下文
-- [ ] Agent 自动感知 shared context
+> 架构决策见 docs/adr/0002（每项目 tree repo + 中心元数据 registry，否决 mono-repo）。
 
-### 4.2 完善与打磨
-- [ ] 完整 README 和安装文档
-- [ ] 错误处理和边界情况
-- [ ] 主题支持（跟随 pi 主题）
+### 3.1 Registry（中心元数据仓）
+- [ ] XDG 数据目录初始化 registry jj repo（git-backed），配置中心私有 remote
+- [ ] `projects/<projectId>.json` 元数据：{ name, vcsRemote?, treeRemote, machines[], sessions摘要[] }
+- [ ] push 项目 tree 后联动更新 registry 记录并 push registry
+- [ ] 项目级 `registry: false` 退出注册（安全阀）
 
-### 4.3 发布
-- [ ] npm package 发布
-- [ ] 安装使用指南
+### 3.2 同步命令（显式，人/agent 均可触发）
+- [ ] `/grove sync push` — push 当前项目 tree repo + 更新 registry
+- [ ] `/grove sync pull` — pull registry，刷新跨机视图
+- [ ] `/grove dashboard` — 跨机 session 列表（origin、lastActiveAt、staleness 可见）
+- [ ] 跨机 cherry-pick：registry 指路 → 从对应 treeRemote fetch 快照 → context-inject 到当前对话
+- [ ] 跨机继续 session：快照物化到本机 sessions 目录 → switchSession
+
+### 3.3 隐私
+- [ ] 文档写死：tree remote 与 registry remote 必须为私有仓库
+- [ ] XDG config 预留 key 字段（v2 加密占位）
 
 ---
 
-## 设计决策记录
+## Phase 4：代码维度（未来）
 
-| 决策 | 记录 |
-|------|------|
-| 常用命令最先交付 | 可以独立使用，不依赖 tree/sync |
-| 一个 branch = 一个 pi session 文件 | 不修改 pi 内核，在上层做项目管理 |
-| /fork → /branch | 统一分支概念，/fork 变成 /branch create |
-| sync 不自动执行、不后台监听 | 用户显式 push/pull，类似 jj |
-| 冲突 = 树上的分支差异 | 不单独存冲突文件，利用 pi session tree |
-| 合并手段 = context inject | 不尝试自动合并消息内容 |
+- [ ] manifest 的 code 字段从只读指针（rev + dirty）升级
+- [ ] checkpoint 联动代码提交（可选）
+- [ ] merge / cherry-pick 的代码联动
+- [ ] jj 作为项目 VCS 时拓扑对齐（对话树 ≡ 代码 DAG）
