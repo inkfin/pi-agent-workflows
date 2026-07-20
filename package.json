@@ -1,0 +1,9 @@
+{
+  "name": "pi-agent-workflow",
+  "version": "0.1.0",
+  "description": "Personal pi agent workflow: commands, project tree, and session sync",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [".pi/extensions/commands"]
+  }
+}
