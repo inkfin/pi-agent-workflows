@@ -31,8 +31,12 @@ import * as fs from "node:fs";
  * If the session file is not in the tree, auto-create a "main" branch
  * or add it as a child of the appropriate parent.
  */
-function ensureCurrentSessionInTree(cwd: string, sessionFile: string | null): void {
+function ensureCurrentSessionInTree(cwd: string, sessionFile: string | null, mode: string): void {
   if (!sessionFile) return;
+
+  // Only auto-register in interactive (TUI) mode.
+  // Print/JSON/RPC modes create ephemeral sessions that shouldn't be tracked.
+  if (mode !== "tui") return;
 
   const tree = loadTree(cwd);
   const existing = tree.branches.find((b) => b.sessionFile === sessionFile);
@@ -43,7 +47,6 @@ function ensureCurrentSessionInTree(cwd: string, sessionFile: string | null): vo
   }
 
   // New session not in tree — auto-register
-  // If no branches exist, make it "main"
   if (tree.branches.length === 0) {
     createBranch(tree, {
       name: "main",
@@ -70,7 +73,7 @@ export function setupBranchCommands(pi: ExtensionAPI) {
   // Auto-register current session on start
   pi.on("session_start", (_event, ctx) => {
     const sessionFile = ctx.sessionManager.getSessionFile();
-    ensureCurrentSessionInTree(ctx.cwd, sessionFile);
+    ensureCurrentSessionInTree(ctx.cwd, sessionFile, ctx.mode);
     if (ctx.hasUI) {
       const tree = loadTree(ctx.cwd);
       const current = getCurrentBranch(tree, sessionFile);
