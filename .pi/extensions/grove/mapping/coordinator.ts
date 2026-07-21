@@ -1,12 +1,13 @@
 /**
- * grove/mapping/coordinator.ts — logical ops with preOpId + receipts
+ * Logical operation coordinator with pre-op restore and durable receipts.
  */
 
-import type { TreeBackend, SessionAnchor } from "../backend/types";
+import { newDomainId, type DispositionRecord, type SessionAnchor, type TreeBackend } from "../backend/types";
 import {
+  inboxFor,
   loadJournal,
-  saveJournal,
   newIntentId,
+  saveJournal,
   type JournalState,
   type OpKind,
   type OpReceipt,
@@ -14,137 +15,175 @@ import {
 } from "../lib/journal";
 
 export class OperationCoordinator {
-  constructor(private be: TreeBackend) {}
+  constructor(private readonly backend: TreeBackend) {}
 
   private journal(): JournalState {
-    return loadJournal(this.be.repoDir());
+    return loadJournal(this.backend.repoDir());
   }
 
   private save(state: JournalState): void {
-    saveJournal(this.be.repoDir(), state);
+    saveJournal(this.backend.repoDir(), state);
   }
 
-  async begin(op: OpKind, payload: Record<string, unknown> = {}): Promise<PendingIntent> {
-    await this.be.ensureRepo();
-    const preOpId = await this.be.currentOperationId();
+  async begin(
+    op: OpKind,
+    payload: Record<string, unknown> = {},
+    sessionId?: string,
+  ): Promise<PendingIntent> {
+    await this.backend.ensureRepo();
     const intent: PendingIntent = {
       id: newIntentId(),
       op,
+      sessionId,
       step: "started",
-      preOpId,
+      preOpId: await this.backend.currentOperationId(),
       payload,
       startedAt: new Date().toISOString(),
     };
-    const j = this.journal();
-    j.pending = intent;
-    this.save(j);
+    const journal = this.journal();
+    if (journal.pendingOp && journal.pendingOp.step !== "failed") {
+      throw new Error(`grove: operation already pending: ${journal.pendingOp.op}`);
+    }
+    journal.pendingOp = intent;
+    this.save(journal);
     return intent;
   }
 
   mark(step: PendingIntent["step"], error?: string): void {
-    const j = this.journal();
-    if (!j.pending) return;
-    j.pending.step = step;
-    if (error) j.pending.error = error;
-    this.save(j);
+    const journal = this.journal();
+    if (!journal.pendingOp) return;
+    journal.pendingOp.step = step;
+    if (error) journal.pendingOp.error = error;
+    this.save(journal);
   }
 
-  async succeed(changeId?: string): Promise<OpReceipt> {
-    const j = this.journal();
-    const pending = j.pending;
+  async succeed(changeId?: string, nodeId?: string): Promise<OpReceipt> {
+    const journal = this.journal();
+    const pending = journal.pendingOp;
     if (!pending) throw new Error("grove: no pending intent");
-    const postOpId = await this.be.currentOperationId();
     const receipt: OpReceipt = {
       id: pending.id,
       op: pending.op,
       preOpId: pending.preOpId ?? "",
-      postOpId,
+      postOpId: await this.backend.currentOperationId(),
       changeId,
+      nodeId,
+      eventId: typeof pending.payload.eventId === "string" ? pending.payload.eventId : undefined,
       completedAt: new Date().toISOString(),
     };
-    j.receipts.unshift(receipt);
-    j.receipts = j.receipts.slice(0, 50);
-    j.pending = null;
-    this.save(j);
+    journal.receipts.unshift(receipt);
+    journal.receipts = journal.receipts.slice(0, 100);
+    journal.pendingOp = null;
+    this.save(journal);
     return receipt;
   }
 
   async failAndRestore(error: string): Promise<void> {
-    const j = this.journal();
-    const pending = j.pending;
+    const journal = this.journal();
+    const pending = journal.pendingOp;
     if (pending?.preOpId) {
       try {
-        await this.be.restoreOperation(pending.preOpId);
+        await this.backend.restoreOperation(pending.preOpId);
       } catch {
-        /* best-effort */
+        /* best effort; pending receipt remains inspectable */
       }
     }
     if (pending) {
       pending.step = "failed";
       pending.error = error;
     }
-    j.pending = pending;
-    this.save(j);
+    journal.pendingOp = pending;
+    this.save(journal);
   }
 
   clearPending(): void {
-    const j = this.journal();
-    j.pending = null;
-    this.save(j);
+    const journal = this.journal();
+    journal.pendingOp = null;
+    this.save(journal);
   }
 
   lastReceipt(): OpReceipt | undefined {
-    return this.journal().receipts.find((r) => !r.undone);
+    return this.journal().receipts.find((receipt) => !receipt.undone);
   }
 
   async undoLast(): Promise<OpReceipt | null> {
-    const j = this.journal();
-    const receipt = j.receipts.find((r) => !r.undone);
+    const journal = this.journal();
+    const receipt = journal.receipts.find((candidate) => !candidate.undone);
     if (!receipt?.preOpId) {
-      await this.be.undo();
+      await this.backend.undo();
       return null;
     }
-    await this.be.restoreOperation(receipt.preOpId);
+    await this.backend.restoreOperation(receipt.preOpId);
+    if (receipt.op === "capture" && receipt.eventId) {
+      const tombstone: DispositionRecord = {
+        v: 1,
+        recordType: "disposition",
+        dispositionId: newDomainId("disposition"),
+        targetType: "proposal",
+        targetId: receipt.eventId,
+        action: "rejected",
+        createdAt: new Date().toISOString(),
+      };
+      await this.backend.applyGraphTransaction({ records: [tombstone] });
+    }
     receipt.undone = true;
-    this.save(j);
+    this.save(journal);
     return receipt;
   }
 
-  setReplaceTarget(changeId: string | null): void {
-    const j = this.journal();
-    j.replaceTarget = changeId;
-    this.save(j);
+  setReplaceTarget(nodeId: string | null): void {
+    const journal = this.journal();
+    journal.replaceTargetNodeId = nodeId;
+    this.save(journal);
   }
 
   getReplaceTarget(): string | null {
-    return this.journal().replaceTarget ?? null;
+    return this.journal().replaceTargetNodeId ?? null;
   }
 
   setPendingFork(forkFrom: JournalState["pendingFork"]): void {
-    const j = this.journal();
-    j.pendingFork = forkFrom;
-    this.save(j);
+    const journal = this.journal();
+    journal.pendingFork = forkFrom;
+    this.save(journal);
   }
 
   consumePendingFork(): JournalState["pendingFork"] {
-    const j = this.journal();
-    const f = j.pendingFork ?? null;
-    j.pendingFork = null;
-    this.save(j);
-    return f;
+    const journal = this.journal();
+    const fork = journal.pendingFork ?? null;
+    journal.pendingFork = null;
+    this.save(journal);
+    return fork;
   }
 
-  setAligned(changeId: string, sessionId: string, anchor: SessionAnchor): void {
-    const j = this.journal();
-    j.lastAligned = { changeId, sessionId, anchor };
-    this.save(j);
+  setAligned(nodeId: string, sessionId: string, anchor: SessionAnchor): void {
+    const journal = this.journal();
+    journal.lastAligned = { nodeId, sessionId, anchor };
+    this.save(journal);
+  }
+
+  getAligned(): JournalState["lastAligned"] {
+    return this.journal().lastAligned;
+  }
+
+  markEventProcessed(sessionId: string, eventId: string, cursor: number): void {
+    const journal = this.journal();
+    const inbox = inboxFor(journal, sessionId);
+    inbox.cursor = Math.max(inbox.cursor, cursor);
+    if (!inbox.processedEventIds.includes(eventId)) inbox.processedEventIds.push(eventId);
+    inbox.processedEventIds = inbox.processedEventIds.slice(-500);
+    journal.inboxBySession[sessionId] = inbox;
+    this.save(journal);
+  }
+
+  eventProcessed(sessionId: string, eventId: string): boolean {
+    return inboxFor(this.journal(), sessionId).processedEventIds.includes(eventId);
   }
 }
 
 export function pendingSummary(repoDir: string): string | null {
-  const j = loadJournal(repoDir);
-  if (j.pending && j.pending.step !== "done") {
-    return `pending ${j.pending.op} (${j.pending.step})${j.pending.error ? `: ${j.pending.error}` : ""}`;
+  const pending = loadJournal(repoDir).pendingOp;
+  if (pending && pending.step !== "done") {
+    return `pending ${pending.op} (${pending.step})${pending.error ? `: ${pending.error}` : ""}`;
   }
   return null;
 }

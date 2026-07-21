@@ -11,4 +11,7 @@
 
 若未来 profiling 证明 CLI 是瓶颈，按同一 `TreeBackend` 接口做 sidecar（stdio NDJSON）替换，不用 napi（避免 Node ABI 与 prebuild 矩阵）。
 
-ADR-0004 补充 `operationId` / `op restore`、bookmark 读写、amend/describe 更新 draft Node 与 frontier 节点；这些能力仍全部经 CLI shell-out。
+ADR-0004 补充 `operationId` / `op restore`、bookmark 与同步能力；ADR-0006
+把存储单位改为 GraphTransaction，并明确 jj change-id/parents 只属于 backend。
+稳定 nodeId、typed Edge 和 Attachment 均在 `TreeBackend` 之上 materialize；这些
+物理能力仍全部经 CLI shell-out。

@@ -1,10 +1,12 @@
 /**
- * grove/lib/journal.ts — pending intents + operation receipts (local only)
+ * Local operation journal. This is a recovery cache; GraphTransactions and
+ * Pi session entries remain the durable truth.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ForkFrom, SessionAnchor } from "../backend/types";
+import type { SessionAnchor } from "../backend/types";
+import type { ForkRef } from "../mapping/ops";
 
 export type OpKind =
   | "checkpoint"
@@ -14,6 +16,10 @@ export type OpKind =
   | "pick"
   | "undo"
   | "auto"
+  | "capture"
+  | "edge"
+  | "attachment"
+  | "pin"
   | "sync_push"
   | "sync_pull"
   | "amend";
@@ -21,6 +27,7 @@ export type OpKind =
 export interface PendingIntent {
   id: string;
   op: OpKind;
+  sessionId?: string;
   step: "started" | "pi" | "jj" | "done" | "failed";
   preOpId?: string;
   payload: Record<string, unknown>;
@@ -34,22 +41,30 @@ export interface OpReceipt {
   preOpId: string;
   postOpId?: string;
   changeId?: string;
+  nodeId?: string;
+  eventId?: string;
   completedAt: string;
   undone?: boolean;
 }
 
+export interface SessionInbox {
+  cursor: number;
+  processedEventIds: string[];
+  rejectedEventIds: string[];
+}
+
 export interface JournalState {
   version: 1;
-  pending: PendingIntent | null;
+  pendingOp: PendingIntent | null;
   receipts: OpReceipt[];
-  /** High-confidence replace target for harness. */
-  replaceTarget?: string | null;
+  inboxBySession: Record<string, SessionInbox>;
+  replaceTargetNodeId?: string | null;
   lastAligned?: {
-    changeId: string;
+    nodeId: string;
     sessionId: string;
     anchor: SessionAnchor;
   };
-  pendingFork?: ForkFrom | null;
+  pendingFork?: ForkRef | null;
 }
 
 function journalPath(repoDir: string): string {
@@ -58,19 +73,40 @@ function journalPath(repoDir: string): string {
 
 export function loadJournal(repoDir: string): JournalState {
   try {
-    const raw = fs.readFileSync(journalPath(repoDir), "utf-8");
-    const parsed = JSON.parse(raw);
-    if (parsed?.version === 1) return parsed as JournalState;
+    const parsed = JSON.parse(fs.readFileSync(journalPath(repoDir), "utf-8"));
+    if (
+      parsed?.version === 1 &&
+      Object.prototype.hasOwnProperty.call(parsed, "pendingOp") &&
+      parsed.inboxBySession &&
+      typeof parsed.inboxBySession === "object"
+    ) {
+      return parsed as JournalState;
+    }
   } catch {
-    /* fresh */
+    /* fresh or obsolete pre-release state */
   }
-  return { version: 1, pending: null, receipts: [] };
+  return {
+    version: 1,
+    pendingOp: null,
+    receipts: [],
+    inboxBySession: {},
+  };
 }
 
 export function saveJournal(repoDir: string, state: JournalState): void {
-  const fp = journalPath(repoDir);
-  fs.mkdirSync(path.dirname(fp), { recursive: true });
-  fs.writeFileSync(fp, JSON.stringify(state, null, 2));
+  const file = journalPath(repoDir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(state, null, 2));
+  fs.renameSync(temporary, file);
+}
+
+export function inboxFor(state: JournalState, sessionId: string): SessionInbox {
+  return state.inboxBySession[sessionId] ?? {
+    cursor: 0,
+    processedEventIds: [],
+    rejectedEventIds: [],
+  };
 }
 
 export function newIntentId(): string {

@@ -1,44 +1,58 @@
-# Grove 数据模型、一致性与同步协议
+# Grove schema、一致性与同步协议
 
-Grove manifest 从 `v: 1` 开始。首个正式发布前，v1 是敏捷开发接口：允许直接修改并 squash 现有实现，不维护旧的 v1 形态、不增加迁移或双读分支。首个发布后，v1 即成为稳定格式；不兼容修改必须提升版本，并在读取边界提供明确的兼容或迁移策略。
+Grove schema 从 `v: 1` 开始。首个正式发布前，v1 直接演进，不维护旧的预发布
+manifest、迁移器或双读分支；首个发布后，v1 才成为兼容边界。
 
-Tree Repo 中的 Node 不符合当前 v1 manifest 结构时按非 Grove commit 处理。
+领域模型已由 [ADR-0006](0006-grove-session-graph-and-outcomes.md) 收敛为
+SessionNode、Edge、Attachment、RunLedger。本 ADR 记录仍然有效的存储、一致性和
+同步约束。
 
-## Manifest 与快照
+## GraphTransaction 与 CAS
 
-Node manifest 以单行 JSON 存入 jj commit description，包含：
-
-- **schema**：`v: 1`
-- **身份**：稳定的 `projectId`、`sessionId`，以及 jj `change-id`
-- **快照**：`snapshotId = sha256(content)`，内容存入 `objects/<snapshotId>.jsonl`
-- **SessionAnchor**：`entryId + entryHash + ordinal + prefixHash`，用于验证对话位置；无法验证时从不可变快照物化
-- **forkFrom**：`{ parentChangeId, parentSessionId, parentAnchor }`，作为 fork 父边的唯一来源
-- **lifecycle**：auto Node 使用 `draft | pinned | published`
-- **context_merge**：记录 `mergeOf[]`、`injectStrategy`、`payloadHash`，明确它是上下文注入而非代码合并
+- jj commit description 保存单行 `GraphTransaction` JSON。
+- `nodeId`、`edgeId`、`attachmentId` 是领域身份；jj change-id 只定位 transaction。
+- Session Snapshot 孏入 `objects/<sha256>.jsonl`。
+- Attachment payload 经 canonicalization、redaction 和大小约束后存入
+  `objects/<sha256>.json`。
+- SessionAnchor 使用 `entryId + entryHash + ordinal + prefixHash`；无法验证本地
+  anchor 时从不可变 Snapshot 物化。
+- draft amend 删除当前 revision 不再引用的 CAS 路径，但 jj/git 历史对象仍由
+  历史和 GC 策略保留。
 
 ## 一致性与 undo
 
-- **OperationCoordinator** 在逻辑操作前保存 intent 与 `preOpId`，步骤成功后写 receipt
-- jj 步骤失败时用 `jj op restore <preOpId>` 回退；pi 与 jj 之间的中间态由本地 pending journal 在 `session_start` 检测
-- `/grove undo` 撤销最近一个 Grove receipt，而不是假设一次 `jj undo` 等于一个业务操作
-- jj operation log 仅属于本机，不同步，也不承诺跨机器 undo
+- `OperationCoordinator` 在逻辑操作前保存 intent 与 `preOpId`，成功后写 receipt。
+- Tree Repo 写入由 in-process queue 和跨进程 writer lock 串行化。
+- mutation 可携带 `expectedGraphRevision`；过期写者必须显式冲突，不能覆盖。
+- Node + Edge + Attachment 作为一个 GraphTransaction 写入。
+- jj 步骤失败时使用 `jj op restore <preOpId>`。
+- journal 使用 `pendingOp + inboxBySession + receipts`，仅是可重建恢复缓存。
+- `/grove undo` 撤销最近 Grove receipt；capture undo 额外写 proposal disposition，
+  防止 session entry replay 复活成果。
+- jj operation log 仅属于本机，不同步，也不承诺跨机器 undo。
 
-## Harness 自动维护
+## Harness
 
-- `agent_settled` 是自动快照边界；仅当工作区存在实际文件变化时创建或更新 auto draft
-- 高置信度“覆盖、重做”可更新同一 change-id，但仅限无后继、未 pin、未 published 的 draft
-- 其他情况创建新 Node，并通过 `supersedes` 保留关系
-- UI 和 `/grove auto keep|replace|split` 允许用户覆盖自动判断
+- Orchestrator 模式由 durable `grove-attachment-proposal` 驱动；Ask/Plan 文本和
+  dirty 电平不能直接生成 outcome Node。
+- `trackingMode` 为 `auto | outcome | legacy | off`。
+- `auto` 在 session 存在 Orchestrator RunLedger 时使用 outcome capture，否则使用
+  legacy dirty fallback。
+- replacement 只允许 amend 同 slot、同 session、未 effective-sealed 的 draft。
+- 用户可用 `/grove auto keep|replace|split` 覆盖 fallback 判断。
 
 ## 同步
 
-- 每个 origin 只写 `grove/origins/<originId>` bookmark
-- push 前创建 frontier Node，使本机所有可见 heads 都可经 Git remote 到达
-- pull 获取各 origin bookmark，并按 jj DAG 合并可见集合
-- Registry 是最终一致的索引：先 push Tree Repo，再更新 Registry；失败写 outbox
-- 同步默认关闭，必须显式配置 private tree remote，并确认私有边界或启用 payload 加密
-- redaction 是降低风险的管道，不是安全边界
+- 每个 origin 只写 `grove/origins/<originId>` bookmark。
+- push transaction 包含 frontier record 和未发布 Node 的 published revision。
+- frontier 保存 semantic head nodeIds；物理 jj parent 只保证 records 可达。
+- pull 获取各 origin bookmark，materializer 按稳定实体 ID 和 revision 重建 graph。
+- Registry 是最终一致索引：先 push Tree Repo，再更新 Registry；失败写 outbox。
+- 同步默认关闭，必须显式配置 private Tree Repo remote，并确认私有边界或启用 payload
+  加密。
+- redaction 只降低风险，不是安全边界。
 
 ## 关系
 
-本 ADR 补强 ADR-0001 的 backend 能力和 ADR-0002 的同步细节，不改变 ADR-0003 关于 Entire 的结论。
+本 ADR 补强 ADR-0001 的 backend 能力和 ADR-0002 的同步细节；领域模型与 outcome
+协议以 ADR-0006 为准，不改变 ADR-0003 关于 Entire 的结论。

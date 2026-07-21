@@ -1,60 +1,124 @@
 /**
- * grove/commands.ts — /grove command + hooks
+ * Grove commands and foreground single-writer hooks.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+  GROVE_PROPOSAL_PENDING_EVENT,
+  ORCHESTRATOR_RUN_ENTRY,
+} from "../shared/outcomes";
 import { JjCliBackend, JjUnavailableError } from "./backend/jj-cli";
-import type { TreeBackend, GroveNode, ForkFrom } from "./backend/types";
+import {
+  isEffectivelySealed,
+  newDomainId,
+  type EdgeKind,
+  type GroveGraph,
+  type SessionNode,
+  type TreeBackend,
+} from "./backend/types";
 import {
   checkpointSession,
-  recordFork,
-  recordMerge,
   ensureSessionAvailable,
-  nodeSummaryForInject,
-  nodeAtChange,
-  pinNode,
   nearestParentNode,
+  nodeSummaryForInject,
+  pinNode,
+  recordContextInjection,
+  recordFork,
+  type ForkRef,
 } from "./mapping/ops";
 import { OperationCoordinator, pendingSummary } from "./mapping/coordinator";
-import { onAgentSettled, looksLikeReplacement, autoAction } from "./mapping/harness";
+import {
+  autoAction,
+  looksLikeReplacement,
+  onLegacyAgentSettled,
+  shouldRunLegacyHarness,
+} from "./mapping/harness";
+import { reconcileProposals } from "./mapping/capture";
 import { syncPush, syncPull, configureSync } from "./mapping/sync";
 import { publishRegistryAfterPush, flushRegistryOutbox, dashboardLines } from "./mapping/registry";
 import { machineId, codeState } from "./lib/identity";
-import { captureAnchor, countSessionMessages } from "./lib/sessions";
+import {
+  captureAnchor,
+  countSessionMessages,
+  resolveAnchor,
+} from "./lib/sessions";
 import { loadProjectSettings } from "./lib/settings";
-import { GroveTreeView, type GroveViewResult } from "./ui/tree-view";
+import {
+  GraphWorkspace,
+  type GraphWorkspaceSnapshot,
+} from "./ui/graph-workspace";
+import { loadNodeThread } from "./ui/thread-loader";
+import type { GroveViewResult } from "./ui/tree-view";
 
-function findNode(nodes: GroveNode[], target: string): GroveNode | undefined {
+function findNode(graph: GroveGraph, target: string): SessionNode | undefined {
   const lower = target.toLowerCase();
   return (
-    nodes.find((n) => n.changeId.startsWith(target)) ??
-    nodes.find((n) => n.manifest?.label === target) ??
-    nodes.find((n) => n.manifest?.label.toLowerCase().includes(lower))
+    graph.nodes.find((node) => node.nodeId.startsWith(target)) ??
+    graph.nodes.find((node) => node.backendRef.changeId.startsWith(target)) ??
+    graph.nodes.find((node) => node.label === target) ??
+    graph.nodes.find((node) => node.label.toLowerCase().includes(lower))
   );
 }
 
-export function groveStatusLabel(node: GroveNode | undefined): string {
-  const m = node?.manifest;
-  if (!m) return "◇ untracked";
-  const glyph =
-    m.kind === "root" ? "◇" :
-    m.kind === "fork" ? "⑂" :
-    m.kind === "context_merge" ? "⊙" :
-    m.kind === "auto" ? "○" :
-    m.kind === "frontier" ? "▣" :
-    "◆";
-  const life = m.lifecycle === "draft" ? "·draft" : "";
-  return `${glyph} ${m.label}${life}`;
+function nodeAtCursor(graph: GroveGraph, changeId: string): SessionNode | undefined {
+  return graph.nodes.find((node) => node.backendRef.changeId === changeId);
+}
+
+function latestForSession(graph: GroveGraph, sessionFile: string | null): SessionNode | undefined {
+  if (!sessionFile) return undefined;
+  const sessionId = path.basename(sessionFile);
+  return graph.nodes
+    .filter((node) => node.sessionId === sessionId)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+}
+
+export async function activeSessionNode(
+  graph: GroveGraph,
+  backend: TreeBackend,
+  sessionFile: string | null,
+): Promise<SessionNode | undefined> {
+  if (sessionFile) {
+    const sessionId = path.basename(sessionFile);
+    const aligned = new OperationCoordinator(backend).getAligned();
+    if (aligned?.sessionId === sessionId) {
+      const node = graph.nodes.find((candidate) => candidate.nodeId === aligned.nodeId);
+      if (node) return node;
+    }
+    return latestForSession(graph, sessionFile);
+  }
+  return nodeAtCursor(graph, await backend.currentChangeId());
+}
+
+export function groveStatusLabel(
+  node: SessionNode | undefined,
+  graph?: GroveGraph,
+): string {
+  if (!node) return "◇ untracked";
+  const attachments = graph?.attachments.filter(
+    (attachment) => attachment.targetNodeId === node.nodeId,
+  ) ?? [];
+  const glyph = attachments.some((attachment) => attachment.kind === "execution_outcome")
+    ? "■"
+    : node.capture.source === "manual"
+      ? "◆"
+      : "○";
+  const draft = graph && !isEffectivelySealed(node, graph.edges) ? "·draft" : "";
+  return `${glyph} ${node.label}${draft}`;
 }
 
 async function refreshGroveStatus(
-  ctx: Pick<ExtensionCommandContext, "ui">,
-  be: TreeBackend,
+  ctx: Pick<ExtensionCommandContext, "ui" | "sessionManager">,
+  backend: TreeBackend,
 ): Promise<void> {
-  const [nodes, currentChange] = await Promise.all([be.listNodes(), be.currentChangeId()]);
-  ctx.ui.setStatus("grove", groveStatusLabel(nodeAtChange(nodes, currentChange)));
+  const graph = await backend.getGraph();
+  const node = await activeSessionNode(
+    graph,
+    backend,
+    ctx.sessionManager.getSessionFile(),
+  );
+  ctx.ui.setStatus("grove", groveStatusLabel(node, graph));
 }
 
 export function setupGrove(pi: ExtensionAPI) {
@@ -69,103 +133,137 @@ export function setupGrove(pi: ExtensionAPI) {
     return backend;
   }
 
+  async function reconcile(ctx: ExtensionCommandContext): Promise<SessionNode | null> {
+    const current = getBackend(ctx.cwd);
+    if (!fs.existsSync(path.join(current.repoDir(), ".jj"))) return null;
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const entries = ctx.sessionManager.getEntries() as any[];
+    const results = await reconcileProposals(current, ctx.cwd, {
+      sessionFile,
+      entryId: ctx.sessionManager.getLeafId(),
+      entries,
+    });
+    const captured = [...results].reverse().find((result) => result.node)?.node ?? null;
+    if (captured) {
+      if (sessionFile && path.basename(sessionFile) === captured.sessionId) {
+        new OperationCoordinator(current).setAligned(
+          captured.nodeId,
+          captured.sessionId,
+          captured.anchor,
+        );
+      }
+      return captured;
+    }
+    const hasOutcomeLedger = entries.some(
+      (entry) => entry.type === "custom" && entry.customType === ORCHESTRATOR_RUN_ENTRY,
+    );
+    if (!shouldRunLegacyHarness(ctx.cwd, hasOutcomeLedger)) return null;
+    const legacy = await onLegacyAgentSettled(current, ctx.cwd, {
+      sessionFile,
+      entryId: ctx.sessionManager.getLeafId(),
+    });
+    if (legacy && sessionFile && path.basename(sessionFile) === legacy.sessionId) {
+      new OperationCoordinator(current).setAligned(
+        legacy.nodeId,
+        legacy.sessionId,
+        legacy.anchor,
+      );
+    }
+    return legacy;
+  }
+
   pi.on("session_start", async (event, ctx) => {
-    if (ctx.mode !== "tui") return;
-    const be = getBackend(ctx.cwd);
-    if (!fs.existsSync(path.join(be.repoDir(), ".jj"))) return;
+    const current = getBackend(ctx.cwd);
+    if (!fs.existsSync(path.join(current.repoDir(), ".jj"))) return;
     try {
       await JjCliBackend.checkAvailability();
     } catch {
       return;
     }
-
-    const pending = pendingSummary(be.repoDir());
-    if (pending && ctx.hasUI) {
-      ctx.ui.notify(`grove: ${pending}`, "warning");
-    }
+    const pending = pendingSummary(current.repoDir());
+    if (pending && ctx.hasUI) ctx.ui.notify(`grove: ${pending}`, "warning");
 
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (event.reason === "fork" && sessionFile) {
       try {
-        const coord = new OperationCoordinator(be);
-        const forkFrom = coord.consumePendingFork();
+        const coordinator = new OperationCoordinator(current);
+        const forkFrom = coordinator.consumePendingFork();
         if (!forkFrom) {
-          ctx.ui.notify(
-            "grove: fork was created outside Grove, so no exact forkFrom intent was available; node not recorded.",
-            "warning",
-          );
-          return;
+          ctx.ui.notify("grove: fork had no foreground Grove intent; node not recorded.", "warning");
+        } else {
+          const parentFile = event.previousSessionFile ?? null;
+          await recordFork(current, ctx.cwd, {
+            sessionFile,
+            entryId: ctx.sessionManager.getLeafId(),
+            forkFrom,
+            snapshotFile: parentFile && fs.existsSync(parentFile) ? parentFile : undefined,
+          });
         }
-        // Snapshot parent session at fork point when available
-        const parentFile = event.previousSessionFile ?? null;
-        await recordFork(be, ctx.cwd, {
-          sessionFile,
-          entryId: ctx.sessionManager.getLeafId(),
-          forkFrom,
-          snapshotFile: parentFile && fs.existsSync(parentFile) ? parentFile : undefined,
-        });
-      } catch (err: any) {
-        ctx.ui.notify(`grove: fork capture failed: ${err?.message ?? err}`, "warning");
+      } catch (error: any) {
+        ctx.ui.notify(`grove: fork capture failed: ${error?.message ?? error}`, "warning");
       }
     }
-
-    if (ctx.hasUI) {
-      try {
-        await refreshGroveStatus(ctx, be);
-      } catch {
-        /* not ready */
-      }
+    try {
+      await reconcile(ctx as ExtensionCommandContext);
+      if (ctx.hasUI) await refreshGroveStatus(ctx as ExtensionCommandContext, current);
+    } catch {
+      /* recovery is retried at settled */
     }
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const be = getBackend(ctx.cwd);
-    if (!fs.existsSync(path.join(be.repoDir(), ".jj"))) return;
+    const current = getBackend(ctx.cwd);
+    if (!fs.existsSync(path.join(current.repoDir(), ".jj"))) return;
     const prompt = typeof event?.prompt === "string" ? event.prompt : "";
     if (!looksLikeReplacement(prompt)) return;
     try {
-      const nodes = await be.listNodes();
-      const current = await be.currentChangeId();
-      const tip = nodeAtChange(nodes, current);
-      if (tip?.manifest?.kind === "auto" || tip?.manifest?.kind === "checkpoint") {
-        new OperationCoordinator(be).setReplaceTarget(tip.changeId);
+      const graph = await current.getGraph();
+      const node = await activeSessionNode(
+        graph,
+        current,
+        ctx.sessionManager.getSessionFile(),
+      );
+      if (node && !isEffectivelySealed(node, graph.edges)) {
+        new OperationCoordinator(current).setReplaceTarget(node.nodeId);
       }
     } catch {
-      /* ignore */
+      /* heuristic only */
     }
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (ctx.mode && ctx.mode !== "tui") return;
-    const be = getBackend(ctx.cwd);
-    if (!fs.existsSync(path.join(be.repoDir(), ".jj"))) return;
     try {
-      const node = await onAgentSettled(be, ctx.cwd, {
-        sessionFile: ctx.sessionManager.getSessionFile(),
-        entryId: ctx.sessionManager.getLeafId(),
-      });
+      const node = await reconcile(ctx as ExtensionCommandContext);
       if (node && ctx.hasUI) {
-        ctx.ui.setStatus("grove", groveStatusLabel(node));
+        const graph = await getBackend(ctx.cwd).getGraph();
+        ctx.ui.setStatus("grove", groveStatusLabel(node, graph));
       }
     } catch {
-      /* auto is best-effort */
+      /* capture is best effort and replayed from session entries */
     }
   });
 
+  try {
+    const events = (pi as any).events;
+    events?.on?.(GROVE_PROPOSAL_PENDING_EVENT, () => {
+      // Notification only. The next foreground settled/session hook reconciles
+      // durable entries; async EventBus listener completion is never required.
+    });
+  } catch {
+    /* EventBus is optional */
+  }
+
   pi.registerCommand("grove", {
-    description: "Grove: session tree (commit, goto, fork, merge, auto, sync, undo)",
+    description: "Grove semantic session graph",
     handler: async (args, ctx) => {
-      const notify = ctx.ui.notify.bind(ctx.ui);
       try {
         await JjCliBackend.checkAvailability();
-      } catch (err: any) {
-        notify(err instanceof JjUnavailableError ? err.message : String(err), "error");
-        return;
-      }
-      try {
         await handle(args, ctx, getBackend(ctx.cwd), pi);
-      } catch (err: any) {
-        notify(`/grove: ${err?.message ?? String(err)}`, "error");
+      } catch (error: any) {
+        ctx.ui.notify(
+          error instanceof JjUnavailableError ? error.message : `/grove: ${error?.message ?? error}`,
+          "error",
+        );
       }
     },
   });
@@ -174,72 +272,67 @@ export function setupGrove(pi: ExtensionAPI) {
 async function handle(
   args: string,
   ctx: ExtensionCommandContext,
-  be: TreeBackend,
+  backend: TreeBackend,
   pi: ExtensionAPI,
 ): Promise<void> {
   const parts = args.trim().split(/\s+/);
-  const sub = parts[0] || "";
+  const subcommand = parts[0] || "";
   const rest = parts.slice(1).join(" ");
 
-  switch (sub) {
+  switch (subcommand) {
     case "commit":
     case "c": {
       const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile) {
-        ctx.ui.notify("No active session.", "error");
-        return;
-      }
+      if (!sessionFile) return ctx.ui.notify("No active session.", "error");
       const label = rest || (await ctx.ui.input("Checkpoint label:"));
       if (!label) return;
-      const node = await checkpointSession(be, ctx.cwd, {
+      const node = await checkpointSession(backend, ctx.cwd, {
         label,
         sessionFile,
         entryId: ctx.sessionManager.getLeafId(),
       });
-      ctx.ui.setStatus("grove", groveStatusLabel(node));
-      ctx.ui.notify(`Checkpoint: ${label} (${node.changeId.slice(0, 8)})`, "success");
-      break;
+      const graph = await backend.getGraph();
+      ctx.ui.setStatus("grove", groveStatusLabel(node, graph));
+      ctx.ui.notify(`Checkpoint: ${label} (${node.nodeId.slice(0, 12)})`, "success");
+      return;
     }
 
     case "goto":
     case "go": {
-      if (!rest) {
-        ctx.ui.notify("Usage: /grove goto <change-id|label>", "error");
-        return;
-      }
-      const nodes = await be.listNodes();
-      const target = findNode(nodes, rest);
-      if (!target?.manifest) {
-        ctx.ui.notify(`Node not found: ${rest}`, "error");
-        return;
-      }
-      await gotoNode(ctx, be, target);
-      break;
+      if (!rest) return ctx.ui.notify("Usage: /grove goto <node-id|label>", "error");
+      const target = findNode(await backend.getGraph(), rest);
+      if (!target) return ctx.ui.notify(`Node not found: ${rest}`, "error");
+      await gotoNode(ctx, backend, target);
+      return;
     }
 
     case "fork":
-    case "f": {
-      await forkFromSelection(ctx, be, null);
-      break;
-    }
+    case "f":
+      await forkFromSelection(ctx, backend, null);
+      return;
 
     case "status":
     case "st": {
-      const nodes = await be.listNodes();
+      const graph = await backend.getGraph();
       const sessionFile = ctx.sessionManager.getSessionFile();
-      const currentChange = await be.currentChangeId();
-      const node = nodeAtChange(nodes, currentChange);
-      const lines: string[] = [];
-      lines.push(`machine: ${machineId()}`);
-      lines.push(`tree repo: ${be.repoDir()}`);
-      lines.push(`@ change: ${currentChange.slice(0, 12)}`);
-      const pending = pendingSummary(be.repoDir());
+      const node = await activeSessionNode(graph, backend, sessionFile);
+      const lines = [
+        `machine: ${machineId()}`,
+        `tree repo: ${backend.repoDir()}`,
+        `graph revision: ${graph.revision.slice(0, 12)}`,
+      ];
+      const pending = pendingSummary(backend.repoDir());
       if (pending) lines.push(`pending: ${pending}`);
-      if (node?.manifest) {
-        lines.push(`current node: ${groveStatusLabel(node)} (${node.changeId.slice(0, 8)})`);
-        lines.push(`lifecycle: ${node.manifest.lifecycle} · kind: ${node.manifest.kind}`);
-        lines.push(`snapshot: ${node.manifest.snapshotId?.slice(0, 12) ?? "none"}`);
-        if (sessionFile && path.basename(sessionFile) === node.manifest.sessionId) {
+      if (node) {
+        const attachments = graph.attachments.filter(
+          (attachment) => attachment.targetNodeId === node.nodeId,
+        );
+        lines.push(`current node: ${groveStatusLabel(node, graph)} (${node.nodeId.slice(0, 16)})`);
+        lines.push(
+          `state: ${isEffectivelySealed(node, graph.edges) ? "sealed" : "draft"} · pinned=${node.pinned} · attachments=${attachments.length}`,
+        );
+        lines.push(`snapshot: ${node.snapshotId?.slice(0, 12) ?? "none"}`);
+        if (sessionFile && path.basename(sessionFile) === node.sessionId) {
           lines.push(`session turns: ${countSessionMessages(sessionFile)}`);
         }
       } else {
@@ -248,314 +341,318 @@ async function handle(
       const code = codeState(ctx.cwd);
       if (code) lines.push(`code: ${code.rev.slice(0, 8)}${code.dirty ? " (dirty)" : ""} fp ${code.fingerprint}`);
       const settings = loadProjectSettings(ctx.cwd);
+      lines.push(`tracking: ${settings.trackingMode ?? "auto"}`);
       lines.push(`sync: ${settings.treeRemote ? "configured" : "off (default)"}`);
-      lines.push(`nodes: ${nodes.length}`);
+      lines.push(`nodes: ${graph.nodes.length} · edges: ${graph.edges.length} · attachments: ${graph.attachments.length}`);
       ctx.ui.notify(lines.join("\n"), "info");
-      break;
+      return;
     }
 
     case "log":
     case "ls": {
-      const nodes = await be.listNodes();
-      if (nodes.length === 0) {
-        ctx.ui.notify("No nodes yet. /grove commit <label>", "info");
-        return;
-      }
-      const currentChange = await be.currentChangeId();
-      const lines = nodes.map((n) => {
-        const m = n.manifest;
-        const at = n.changeId === currentChange ? "@" : " ";
-        return `${at} ${groveStatusLabel(n)} ${n.changeId.slice(0, 8)}${m?.origin ? ` · ${m.origin}` : ""}`;
-      });
-      ctx.ui.notify(lines.join("\n"), "info");
-      break;
+      const graph = await backend.getGraph();
+      if (!graph.nodes.length) return ctx.ui.notify("No nodes yet. /grove commit <label>", "info");
+      const current = await activeSessionNode(
+        graph,
+        backend,
+        ctx.sessionManager.getSessionFile(),
+      );
+      ctx.ui.notify(
+        graph.nodes
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .map((node) => {
+            const at = node.nodeId === current?.nodeId ? "@" : " ";
+            return `${at} ${groveStatusLabel(node, graph)} ${node.nodeId.slice(0, 14)} · ${node.origin}`;
+          })
+          .join("\n"),
+        "info",
+      );
+      return;
     }
 
     case "undo":
     case "u": {
-      const coord = new OperationCoordinator(be);
-      const receipt = await coord.undoLast();
-      await refreshGroveStatus(ctx, be);
+      const receipt = await new OperationCoordinator(backend).undoLast();
+      await refreshGroveStatus(ctx, backend);
       ctx.ui.notify(
-        receipt
-          ? `Undid ${receipt.op} (restored op ${receipt.preOpId.slice(0, 8)})`
-          : "Undid last jj operation.",
+        receipt ? `Undid ${receipt.op} (restored ${receipt.preOpId.slice(0, 8)})` : "Undid last jj operation.",
         "success",
       );
-      break;
+      return;
     }
 
     case "merge":
     case "m":
     case "pick":
     case "p": {
-      if (!rest) {
-        ctx.ui.notify(`Usage: /grove ${sub} <change-id|label>`, "error");
-        return;
-      }
-      const nodes = await be.listNodes();
-      const target = findNode(nodes, rest);
-      if (!target?.manifest) {
-        ctx.ui.notify(`Node not found: ${rest}`, "error");
-        return;
-      }
-      await injectNode(pi, ctx, be, target, sub === "m" || sub === "merge");
-      break;
+      if (!rest) return ctx.ui.notify(`Usage: /grove ${subcommand} <node-id|label>`, "error");
+      const target = findNode(await backend.getGraph(), rest);
+      if (!target) return ctx.ui.notify(`Node not found: ${rest}`, "error");
+      await injectNode(pi, ctx, backend, target, subcommand === "m" || subcommand === "merge");
+      return;
     }
 
     case "auto": {
-      const [action, target] = rest.split(/\s+/);
-      if (!action || !["keep", "replace", "split"].includes(action)) {
-        ctx.ui.notify("Usage: /grove auto <keep|replace|split> [change-id]", "error");
-        return;
+      const [action, targetRef] = rest.split(/\s+/);
+      if (!["keep", "replace", "split"].includes(action)) {
+        return ctx.ui.notify("Usage: /grove auto <keep|replace|split> [node-id]", "error");
       }
-      const nodes = await be.listNodes();
-      const changeId = target
-        ? findNode(nodes, target)?.changeId
-        : await be.currentChangeId();
-      if (!changeId) {
-        ctx.ui.notify("No target node.", "error");
-        return;
-      }
-      const msg = await autoAction(be, ctx.cwd, action as "keep" | "replace" | "split", changeId);
-      await refreshGroveStatus(ctx, be);
-      ctx.ui.notify(msg, "success");
-      break;
+      const graph = await backend.getGraph();
+      const target =
+        (targetRef ? findNode(graph, targetRef) : undefined) ??
+        await activeSessionNode(graph, backend, ctx.sessionManager.getSessionFile());
+      if (!target) return ctx.ui.notify("No target node.", "error");
+      const message = await autoAction(
+        backend,
+        action as "keep" | "replace" | "split",
+        target.nodeId,
+      );
+      await refreshGroveStatus(ctx, backend);
+      ctx.ui.notify(message, "success");
+      return;
     }
 
     case "pin": {
-      const nodes = await be.listNodes();
-      const target = rest ? findNode(nodes, rest) : nodeAtChange(nodes, await be.currentChangeId());
-      if (!target) {
-        ctx.ui.notify("Node not found.", "error");
-        return;
+      const graph = await backend.getGraph();
+      const target =
+        (rest ? findNode(graph, rest) : undefined) ??
+        await activeSessionNode(graph, backend, ctx.sessionManager.getSessionFile());
+      if (!target) return ctx.ui.notify("Node not found.", "error");
+      await pinNode(backend, target.nodeId);
+      await refreshGroveStatus(ctx, backend);
+      ctx.ui.notify(`Pinned ${target.label}`, "success");
+      return;
+    }
+
+    case "edge": {
+      const [operation, kindOrId, fromRef, toRef] = rest.split(/\s+/);
+      if (operation === "add") {
+        if (!["lineage", "context", "supersedes"].includes(kindOrId) || !fromRef || !toRef) {
+          return ctx.ui.notify("Usage: /grove edge add <lineage|context|supersedes> <from> <to>", "error");
+        }
+        const graph = await backend.getGraph();
+        const from = findNode(graph, fromRef);
+        const to = findNode(graph, toRef);
+        if (!from || !to) return ctx.ui.notify("Edge endpoint not found.", "error");
+        const edge = await connectNodes(backend, kindOrId as EdgeKind, from.nodeId, to.nodeId);
+        ctx.ui.notify(`Added ${edge.kind} edge ${edge.edgeId.slice(0, 14)}`, "success");
+      } else if (operation === "delete" && kindOrId) {
+        await disconnectEdge(backend, kindOrId);
+        ctx.ui.notify(`Deleted edge ${kindOrId}`, "success");
+      } else {
+        ctx.ui.notify("Usage: /grove edge <add|delete> ...", "error");
       }
-      await pinNode(be, target.changeId);
-      await refreshGroveStatus(ctx, be);
-      ctx.ui.notify(`Pinned ${target.manifest?.label}`, "success");
-      break;
+      return;
     }
 
     case "realign": {
-      const nodes = await be.listNodes();
-      const current = await be.currentChangeId();
-      const node = nodeAtChange(nodes, current);
-      if (!node?.manifest) {
-        ctx.ui.notify("Nothing to realign (@ has no grove manifest).", "info");
-        return;
-      }
-      await gotoNode(ctx, be, node);
-      break;
+      const graph = await backend.getGraph();
+      const node = await activeSessionNode(
+        graph,
+        backend,
+        ctx.sessionManager.getSessionFile(),
+      );
+      if (!node) return ctx.ui.notify("Nothing to realign.", "info");
+      await gotoNode(ctx, backend, node);
+      return;
     }
 
     case "sync": {
-      const syncSub = rest.split(/\s+/)[0] || "";
-      const syncRest = rest.split(/\s+/).slice(1).join(" ");
-      if (syncSub === "push") {
-        const msg = await syncPush(be, ctx.cwd);
-        const frontier = (await be.listNodes()).find((n) => n.manifest?.kind === "frontier");
-        const reg = publishRegistryAfterPush(ctx.cwd, {
-          frontierCommitId: frontier?.commitId ?? frontier?.changeId ?? "",
-        });
+      const [operation, url] = rest.split(/\s+/);
+      if (operation === "push") {
+        const message = await syncPush(backend, ctx.cwd);
+        publishRegistryAfterPush(ctx.cwd, { frontierCommitId: await backend.currentChangeId() });
         const flushed = flushRegistryOutbox(ctx.cwd);
-        ctx.ui.notify(`${msg}\n${reg}${flushed ? `\nflushed outbox ${flushed}` : ""}`, "success");
-      } else if (syncSub === "pull") {
-        const msg = await syncPull(be, ctx.cwd);
-        ctx.ui.notify(msg, "success");
-      } else if (syncSub === "config") {
-        const url = syncRest.split(/\s+/)[0];
-        if (!url) {
-          ctx.ui.notify("Usage: /grove sync config <treeRemoteUrl> [--private|--encrypt]", "error");
-          return;
-        }
-        const msg = configureSync(ctx.cwd, {
-          treeRemote: url,
-          confirmPrivate: syncRest.includes("--private"),
-          encrypt: syncRest.includes("--encrypt"),
-        });
-        ctx.ui.notify(msg, "success");
+        ctx.ui.notify(`${message}${flushed ? `\nflushed outbox ${flushed}` : ""}`, "success");
+      } else if (operation === "pull") {
+        ctx.ui.notify(await syncPull(backend, ctx.cwd), "success");
+      } else if (operation === "config" && url) {
+        ctx.ui.notify(
+          configureSync(ctx.cwd, {
+            treeRemote: url,
+            confirmPrivate: rest.includes("--private"),
+            encrypt: rest.includes("--encrypt"),
+          }),
+          "success",
+        );
       } else {
         ctx.ui.notify("Usage: /grove sync <push|pull|config>", "info");
       }
-      break;
+      return;
     }
 
-    case "dashboard": {
+    case "dashboard":
       flushRegistryOutbox(ctx.cwd);
       ctx.ui.notify(["Grove registry dashboard:", ...dashboardLines()].join("\n"), "info");
-      break;
-    }
+      return;
 
     case "": {
-      if (ctx.mode !== "tui") {
-        ctx.ui.notify("Interactive tree view requires TUI mode.", "error");
-        return;
-      }
-      await be.ensureRepo();
-      const nodes = await be.listNodes();
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      const currentChange = await be.currentChangeId();
-      const currentRef = sessionFile ? path.basename(sessionFile) : null;
-
-      const result: GroveViewResult | null = await ctx.ui.custom<GroveViewResult | null>(
-        (_tui, theme, _kb, done) => {
-          const view = new GroveTreeView(nodes, currentChange, currentRef, theme);
-          view.setResolve((r) => done(r));
-          return view;
-        },
-      );
-
-      if (!result || result.action === "close") break;
-
-      switch (result.action) {
-        case "goto":
-          if (result.node) await gotoNode(ctx, be, result.node);
-          break;
-        case "commit": {
-          const label = await ctx.ui.input("Checkpoint label:");
-          const sf = ctx.sessionManager.getSessionFile();
-          if (label && sf) {
-            const node = await checkpointSession(be, ctx.cwd, {
-              label,
-              sessionFile: sf,
-              entryId: ctx.sessionManager.getLeafId(),
+      if (ctx.mode !== "tui") return ctx.ui.notify("Interactive tree view requires TUI mode.", "error");
+      await backend.ensureRepo();
+      let workspaceState: GraphWorkspaceSnapshot | undefined;
+      while (true) {
+        const graph = await backend.getGraph();
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        const current = await activeSessionNode(graph, backend, sessionFile);
+        let workspace: GraphWorkspace | undefined;
+        const result = await ctx.ui.custom<GroveViewResult | null>(
+          (tui, theme, _kb, done) => {
+            workspace = new GraphWorkspace({
+              graph,
+              currentNodeId: current?.nodeId ?? null,
+              currentSessionRef: sessionFile ? path.basename(sessionFile) : null,
+              initialSelectedNodeId: workspaceState?.selectedNodeId,
+              initialCamera: workspaceState?.camera,
+              tui,
+              theme,
+              loadThread: (node) => loadNodeThread(backend, ctx.cwd, node),
+              done,
             });
-            ctx.ui.setStatus("grove", groveStatusLabel(node));
-            ctx.ui.notify(`Checkpoint: ${label}`, "success");
-          }
-          break;
-        }
-        case "fork":
-          await forkFromSelection(ctx, be, result.node ?? null);
-          break;
-        case "merge":
-          if (result.node) await injectNode(pi, ctx, be, result.node, true);
-          break;
-        case "pick":
-          if (result.node) await injectNode(pi, ctx, be, result.node, false);
-          break;
-        case "undo": {
-          const coord = new OperationCoordinator(be);
-          await coord.undoLast();
-          await refreshGroveStatus(ctx, be);
-          ctx.ui.notify("Undid last grove operation.", "success");
-          break;
-        }
-        case "auto-keep":
-        case "auto-replace":
-        case "auto-split": {
-          if (!result.node) break;
-          const action =
-            result.action === "auto-keep" ? "keep" :
-            result.action === "auto-replace" ? "replace" : "split";
-          const msg = await autoAction(be, ctx.cwd, action, result.node.changeId);
-          await refreshGroveStatus(ctx, be);
-          ctx.ui.notify(msg, "success");
-          break;
-        }
-        case "realign": {
-          const n = result.node ?? nodeAtChange(await be.listNodes(), await be.currentChangeId());
-          if (n) await gotoNode(ctx, be, n);
-          break;
-        }
-        case "sync-push": {
-          const msg = await syncPush(be, ctx.cwd);
-          const frontier = (await be.listNodes()).find((n) => n.manifest?.kind === "frontier");
-          publishRegistryAfterPush(ctx.cwd, {
-            frontierCommitId: frontier?.commitId ?? frontier?.changeId ?? "",
-          });
-          ctx.ui.notify(msg, "success");
-          break;
-        }
-        case "sync-pull":
-          ctx.ui.notify(await syncPull(be, ctx.cwd), "success");
-          break;
-        case "dashboard":
-          ctx.ui.notify(["Grove registry dashboard:", ...dashboardLines()].join("\n"), "info");
-          break;
-        case "pin":
-          if (result.node) {
-            await pinNode(be, result.node.changeId);
-            ctx.ui.notify(`Pinned ${result.node.manifest?.label}`, "success");
-          }
-          break;
+            return workspace;
+          },
+        );
+        workspaceState = workspace?.getSnapshot();
+        if (!result || result.action === "close") return;
+        await handleViewResult(result, ctx, backend, pi);
+        // These actions replace the active session or intentionally return
+        // context to chat. All other actions refresh the graph in-place.
+        if (["goto", "realign", "fork", "merge", "pick"].includes(result.action)) return;
       }
-      break;
     }
 
-    default: {
+    default:
       ctx.ui.notify(
-        `Unknown: ${sub}\nUsage: /grove [commit|goto|fork|status|log|undo|merge|pick|auto|pin|realign|sync|dashboard]`,
+        `Unknown: ${subcommand}\nUsage: /grove [commit|goto|fork|status|log|undo|merge|pick|auto|pin|edge|realign|sync|dashboard]`,
         "error",
       );
+  }
+}
+
+async function handleViewResult(
+  result: GroveViewResult,
+  ctx: ExtensionCommandContext,
+  backend: TreeBackend,
+  pi: ExtensionAPI,
+): Promise<void> {
+  switch (result.action) {
+    case "goto":
+      if (result.node) await gotoNode(ctx, backend, result.node);
+      break;
+    case "commit": {
+      const label = await ctx.ui.input("Checkpoint label:");
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (label && sessionFile) {
+        await checkpointSession(backend, ctx.cwd, {
+          label,
+          sessionFile,
+          entryId: ctx.sessionManager.getLeafId(),
+        });
+      }
       break;
     }
+    case "fork":
+      await forkFromSelection(ctx, backend, result.node ?? null);
+      break;
+    case "merge":
+    case "pick":
+      if (result.node) await injectNode(pi, ctx, backend, result.node, result.action === "merge");
+      break;
+    case "undo":
+      await new OperationCoordinator(backend).undoLast();
+      break;
+    case "auto-keep":
+    case "auto-replace":
+    case "auto-split":
+      if (result.node) {
+        const action =
+          result.action === "auto-keep" ? "keep" :
+          result.action === "auto-replace" ? "replace" : "split";
+        ctx.ui.notify(await autoAction(backend, action, result.node.nodeId), "success");
+      }
+      break;
+    case "realign":
+      if (result.node) await gotoNode(ctx, backend, result.node);
+      break;
+    case "sync-push": {
+      const message = await syncPush(backend, ctx.cwd);
+      publishRegistryAfterPush(ctx.cwd, {
+        frontierCommitId: await backend.currentChangeId(),
+      });
+      const flushed = flushRegistryOutbox(ctx.cwd);
+      ctx.ui.notify(
+        `${message}${flushed ? `\nflushed outbox ${flushed}` : ""}`,
+        "success",
+      );
+      break;
+    }
+    case "sync-pull":
+      ctx.ui.notify(await syncPull(backend, ctx.cwd), "success");
+      break;
+    case "dashboard":
+      ctx.ui.notify(["Grove registry dashboard:", ...dashboardLines()].join("\n"), "info");
+      break;
+    case "pin":
+      if (result.node) await pinNode(backend, result.node.nodeId);
+      break;
+    case "close":
+      break;
   }
+  await refreshGroveStatus(ctx, backend);
 }
 
 async function forkFromSelection(
   ctx: ExtensionCommandContext,
-  be: TreeBackend,
-  selected: GroveNode | null,
+  backend: TreeBackend,
+  selected: SessionNode | null,
 ): Promise<void> {
   const sessionFile = ctx.sessionManager.getSessionFile();
-  if (!sessionFile) {
-    ctx.ui.notify("No active session.", "error");
-    return;
-  }
-  const nodes = await be.listNodes();
-  const coord = new OperationCoordinator(be);
-
-  let forkFrom: ForkFrom;
+  if (!sessionFile) return ctx.ui.notify("No active session.", "error");
+  const graph = await backend.getGraph();
+  let forkFrom: ForkRef;
   let forkEntry: string | null;
 
-  if (selected?.manifest) {
-    // Fork from selected node's anchor (may be historical)
-    forkEntry = selected.manifest.anchor.entryId ?? ctx.sessionManager.getLeafId();
-    const parent =
-      nearestParentNode(nodes, selected.manifest.sessionId, selected.manifest.anchor) ?? selected;
-    forkFrom = {
-      parentChangeId: parent.changeId,
-      parentSessionId: selected.manifest.sessionId,
-      parentAnchor: selected.manifest.anchor,
-    };
-    // Must be same session file to fork at entry without goto
-    if (path.basename(sessionFile) !== selected.manifest.sessionId) {
-      ctx.ui.notify(
-        `Goto "${selected.manifest.label}" first (different session), then fork.`,
-        "info",
-      );
-      return;
+  if (selected) {
+    if (path.basename(sessionFile) !== selected.sessionId) {
+      return ctx.ui.notify(`Goto "${selected.label}" first, then fork.`, "info");
     }
+    const resolved = resolveAnchor(sessionFile, selected.anchor);
+    if (!resolved.ok || !resolved.entryId) {
+      return ctx.ui.notify(
+        `Cannot fork "${selected.label}": its exact SessionAnchor is unavailable.`,
+        "error",
+      );
+    }
+    forkEntry = resolved.entryId;
+    const parent = nearestParentNode(graph, selected.sessionId, selected.anchor) ?? selected;
+    forkFrom = {
+      parentNodeId: parent.nodeId,
+      parentSessionId: selected.sessionId,
+      parentAnchor: selected.anchor,
+    };
   } else {
     forkEntry = ctx.sessionManager.getLeafId();
-    if (!forkEntry) {
-      ctx.ui.notify("No active session entry to fork from.", "error");
-      return;
-    }
+    if (!forkEntry) return ctx.ui.notify("No active session entry to fork from.", "error");
     const anchor = captureAnchor(sessionFile, forkEntry);
     const parent =
-      nearestParentNode(nodes, path.basename(sessionFile), anchor) ??
-      nodeAtChange(nodes, await be.currentChangeId());
-    if (!parent) {
-      ctx.ui.notify("No parent node — create a checkpoint first.", "error");
-      return;
-    }
+      nearestParentNode(graph, path.basename(sessionFile), anchor) ??
+      latestForSession(graph, sessionFile);
+    if (!parent) return ctx.ui.notify("No parent node — create a checkpoint first.", "error");
     forkFrom = {
-      parentChangeId: parent.changeId,
+      parentNodeId: parent.nodeId,
       parentSessionId: path.basename(sessionFile),
       parentAnchor: anchor,
     };
   }
 
-  coord.setPendingFork(forkFrom);
+  const coordinator = new OperationCoordinator(backend);
+  coordinator.setPendingFork(forkFrom);
   const result = await ctx.fork(forkEntry!, {
     withSession: async (replacementCtx) => {
-      replacementCtx.ui.notify("Forked — node recorded in grove.", "success");
+      replacementCtx.ui.notify("Forked — node recorded in Grove.", "success");
     },
   });
   if (result.cancelled) {
-    coord.consumePendingFork();
+    coordinator.consumePendingFork();
     ctx.ui.notify("Fork cancelled.", "info");
   }
 }
@@ -563,87 +660,115 @@ async function forkFromSelection(
 async function injectNode(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
-  be: TreeBackend,
-  target: GroveNode,
-  asMerge: boolean,
+  backend: TreeBackend,
+  target: SessionNode,
+  recordContext: boolean,
 ): Promise<void> {
-  const summary = await nodeSummaryForInject(be, target);
-  const header = asMerge ? "Merged node" : "Cherry-picked node";
-  const payload = `## ${header}: ${target.manifest!.label}\n\n${summary}\n\nConsider the above work as context for continuing the current task.`;
+  const summary = await nodeSummaryForInject(backend, target);
+  const header = recordContext ? "Context from node" : "Injected node";
+  const payload = `## ${header}: ${target.label}\n\n${summary}\n\nConsider this work as context for the current task.`;
   pi.sendUserMessage(payload, { deliverAs: "followUp" });
-  if (asMerge) {
+  if (recordContext) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (sessionFile) {
-      await recordMerge(be, ctx.cwd, {
-        label: `merge: ${target.manifest!.label}`,
+      await recordContextInjection(backend, ctx.cwd, {
+        label: `context: ${target.label}`,
         sessionFile,
         source: target,
-        strategy: "summary",
         payload,
       });
     }
   }
-  ctx.ui.notify(`${header}: ${target.manifest!.label}`, "success");
+  ctx.ui.notify(`${header}: ${target.label}`, "success");
+}
+
+export async function connectNodes(
+  backend: TreeBackend,
+  kind: EdgeKind,
+  fromNodeId: string,
+  toNodeId: string,
+) {
+  const coordinator = new OperationCoordinator(backend);
+  await coordinator.begin("edge", { kind, fromNodeId, toNodeId });
+  try {
+    const graph = await backend.getGraph();
+    const edge = await backend.appendEdge({
+      edge: {
+        v: 1,
+        recordType: "edge",
+        edgeId: newDomainId("edge"),
+        revision: 1,
+        fromNodeId,
+        toNodeId,
+        kind,
+        state: "active",
+        createdAt: new Date().toISOString(),
+      },
+      expectedGraphRevision: graph.revision,
+    });
+    await coordinator.succeed(edge.backendRef.changeId);
+    return edge;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
+  }
+}
+
+export async function disconnectEdge(backend: TreeBackend, edgeId: string) {
+  const coordinator = new OperationCoordinator(backend);
+  await coordinator.begin("edge", { edgeId, action: "delete" });
+  try {
+    const graph = await backend.getGraph();
+    const edge = await backend.deleteEdge({ edgeId, expectedGraphRevision: graph.revision });
+    await coordinator.succeed(edge.backendRef.changeId);
+    return edge;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
+  }
 }
 
 export async function gotoNode(
   ctx: ExtensionCommandContext,
-  be: TreeBackend,
-  target: GroveNode,
+  backend: TreeBackend,
+  target: SessionNode,
 ): Promise<void> {
-  const m = target.manifest!;
-  const availability = await ensureSessionAvailable(be, ctx.cwd, target);
+  const availability = await ensureSessionAvailable(backend, ctx.cwd, target);
   if (!availability) {
-    ctx.ui.notify(
-      `Session ${m.sessionId} unavailable and no snapshot in the tree.`,
+    return ctx.ui.notify(`Session ${target.sessionId} unavailable and no snapshot exists.`, "error");
+  }
+  if (!availability.anchorOk || !availability.anchorEntryId) {
+    return ctx.ui.notify(
+      `Cannot navigate to exact SessionAnchor (${availability.anchorReason ?? "entry unavailable"}).`,
       "error",
     );
-    return;
   }
-  if (!availability.anchorOk) {
-    ctx.ui.notify(
-      `Anchor stale (${availability.anchorReason}); opened materialized/local session at best effort.`,
-      "warning",
-    );
-  }
-
-  const currentSessionFile = ctx.sessionManager.getSessionFile();
-  const targetChangeId = target.changeId;
-  const targetLabel = m.label;
-  const entryId = m.anchor.entryId;
-
-  // Prefer pi alignment first, then jj edit (ADR-0004)
-  if (currentSessionFile && availability.path === currentSessionFile) {
-    if (entryId) {
-      try {
-        await ctx.navigateTree(entryId, { summarize: true });
-      } catch {
-        /* entry may be gone; continue */
+  const align = async (replacementCtx: ExtensionCommandContext) => {
+    try {
+      await replacementCtx.navigateTree(availability.anchorEntryId!, { summarize: true });
+    } catch {
+      if (!availability.materialized) {
+        return replacementCtx.ui.notify(
+          `Failed to navigate to SessionAnchor ${availability.anchorEntryId}.`,
+          "error",
+        );
       }
+      // A materialized snapshot already ends at the exact anchor; old compacted
+      // entry IDs need not be navigable by the current SessionManager.
     }
-    await be.edit(targetChangeId);
-    ctx.ui.setStatus("grove", groveStatusLabel(target));
-    ctx.ui.notify(`@ → ${targetLabel}`, "success");
-    new OperationCoordinator(be).setAligned(targetChangeId, m.sessionId, m.anchor);
-    return;
-  }
+    await backend.gotoNode(target.nodeId);
+    const graph = await backend.getGraph();
+    replacementCtx.ui.setStatus("grove", groveStatusLabel(target, graph));
+    replacementCtx.ui.notify(`@ → ${target.label}`, "success");
+    new OperationCoordinator(backend).setAligned(target.nodeId, target.sessionId, target.anchor);
+  };
 
-  await ctx.switchSession(availability.path, {
-    withSession: async (replacementCtx) => {
-      if (entryId) {
-        try {
-          await replacementCtx.navigateTree(entryId, { summarize: true });
-        } catch {
-          /* ignore */
-        }
-      }
-      await be.edit(targetChangeId);
-      replacementCtx.ui.setStatus("grove", groveStatusLabel(target));
-      replacementCtx.ui.notify(
-        `@ → ${targetLabel}${availability.materialized ? " (materialized from snapshot)" : ""}`,
-        "success",
-      );
-      new OperationCoordinator(be).setAligned(targetChangeId, m.sessionId, m.anchor);
-    },
-  });
+  if (
+    ctx.sessionManager.getSessionFile() === availability.path &&
+    !availability.materialized
+  ) {
+    await align(ctx);
+  } else {
+    await ctx.switchSession(availability.path, { withSession: align });
+  }
 }

@@ -2,6 +2,8 @@
  * orchestrator/types.ts — Ask → Plan → Build workflow types
  */
 
+import type { WorkspaceEffect } from "../shared/outcomes";
+
 export type WorkflowMode = "auto" | "ask" | "plan" | "build";
 
 export type TaskKind = "research" | "edit" | "review" | "test";
@@ -60,14 +62,23 @@ export interface TaskRunState {
   model?: string;
   worktreePath?: string;
   branch?: string;
+  baseCodeRevision?: string;
+  /** Immutable worker result commit; worktree path/branch remain local diagnostics. */
+  resultRevision?: string;
   summary?: string;
   error?: string;
   outputPreview?: string;
 }
 
 export interface BuildRunState {
+  workItemId: string;
+  buildAttemptId: string;
+  sequence: number;
   planRevision: number;
   status: "idle" | "running" | "succeeded" | "failed" | "cancelled";
+  baseNodeId: string | null;
+  baseCodeRevision: string | null;
+  workspaceEffect: WorkspaceEffect;
   baselineSha?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -79,6 +90,9 @@ export interface BuildRunState {
 export interface WorkflowSnapshot {
   mode: WorkflowMode;
   previousTools?: string[];
+  workItemId?: string;
+  nextBuildSequence?: number;
+  pendingSummaryAttemptId?: string;
   plan?: ExecutionPlan;
   revisions: PlanRevisionRecord[];
   build?: BuildRunState;

@@ -1,145 +1,233 @@
 /**
- * grove/backend/types.ts — TreeBackend interface and current NodeManifest
+ * Grove domain model.
  *
- * See docs/adr/0004. Content-addressed snapshots + SessionAnchor.
- * Node identity = jj change-id. Manifest = single-line commit description.
+ * Domain identity and topology are deliberately independent from jj:
+ * nodeId/edgeId/attachmentId identify entities, while jj change ids only
+ * locate immutable GraphTransaction revisions in the storage repository.
  */
 
-/** Durable node kinds. Turns are ephemeral; only these enter the tree. */
-export type NodeKind =
-  | "root"
-  | "checkpoint"
-  | "fork"
-  | "context_merge"
-  | "auto"
-  | "frontier";
-
-/** draft = harness-mutable; pinned = manual/fixed; published = synced. */
-export type NodeLifecycle = "draft" | "pinned" | "published";
-
-export type InjectStrategy = "summary" | "subtree" | "full";
-
-const NODE_KINDS: ReadonlySet<string> = new Set([
-  "root",
-  "checkpoint",
-  "fork",
-  "context_merge",
-  "auto",
-  "frontier",
-]);
-
-const NODE_LIFECYCLES: ReadonlySet<string> = new Set([
-  "draft",
-  "pinned",
-  "published",
-]);
-
-/** Durable pointer into a pi session (not the Cursor product). */
 export interface SessionAnchor {
   entryId: string | null;
-  /** Hash of the entry line content when captured. */
   entryHash?: string | null;
-  /** 0-based JSONL line ordinal at capture time. */
   ordinal?: number | null;
-  /** Hash of all content before the anchor (compaction fallback). */
   prefixHash?: string | null;
 }
 
-export interface ForkFrom {
-  parentChangeId: string;
-  parentSessionId: string;
-  parentAnchor: SessionAnchor;
+export interface CodeState {
+  vcs: "git" | "jj";
+  rev: string;
+  dirty: boolean;
+  fingerprint?: string;
 }
 
-export interface MergeSource {
-  changeId: string;
-  label: string;
-  sessionId: string;
-  anchor: SessionAnchor;
-}
+export type CaptureSource = "manual" | "harness" | "orchestrator";
+export type AttachmentKind =
+  | "execution_outcome"
+  | "summary"
+  | "execution_plan"
+  | "decision"
+  | "research_report"
+  | "context_injection";
+export type EdgeKind = "lineage" | "context" | "supersedes";
 
-export interface NodeManifest {
-  /** Published schema identifier. Mutable in-place until Grove's first release. */
+export interface SessionNodeRecord {
   v: 1;
-  kind: NodeKind;
+  recordType: "node";
+  nodeId: string;
+  revision: number;
   label: string;
-  /** Stable project id (hash of remote or basename). */
   projectId: string;
-  /** Session identity: basename without implying path portability alone. */
   sessionId: string;
-  /** Content-addressed snapshot; null for root/frontier/fork-without-snap. */
   snapshotId: string | null;
   anchor: SessionAnchor;
-  lifecycle: NodeLifecycle;
+  capture: {
+    source: CaptureSource;
+    slotId?: string;
+    latestEventId?: string;
+    sequence?: number;
+  };
+  state: "draft" | "sealed";
+  pinned: boolean;
+  publishedAt?: string;
   project: { name: string; vcsRemote?: string };
+  code?: CodeState | null;
   origin: string;
-  code?: { vcs: "git" | "jj"; rev: string; dirty: boolean; fingerprint?: string } | null;
   createdAt: string;
-  /** Present on fork nodes. */
-  forkFrom?: ForkFrom;
-  /** Present on context_merge nodes. */
-  mergeOf?: MergeSource[];
-  injectStrategy?: InjectStrategy;
-  payloadHash?: string;
-  /** Auto/replacement: prior change-id this node supersedes. */
-  supersedes?: string | null;
-  /** Optional human note. */
-  note?: string;
+  updatedAt: string;
 }
 
-/** A node in the tree DAG = manifest + jj topology. */
-export interface GroveNode {
+export interface EdgeRecord {
+  v: 1;
+  recordType: "edge";
+  edgeId: string;
+  revision: number;
+  fromNodeId: string;
+  toNodeId: string;
+  kind: EdgeKind;
+  state: "active" | "deleted";
+  payloadHash?: string;
+  createdAt: string;
+}
+
+export interface AttachmentRecord {
+  v: 1;
+  recordType: "attachment";
+  attachmentId: string;
+  targetNodeId: string;
+  kind: AttachmentKind;
+  producer: { extension: string; sourceId: string };
+  contentHash: string;
+  payloadPath?: string;
+  createdAt: string;
+}
+
+export interface DispositionRecord {
+  v: 1;
+  recordType: "disposition";
+  dispositionId: string;
+  targetType: "proposal" | "attachment";
+  targetId: string;
+  action: "rejected" | "tombstoned";
+  createdAt: string;
+}
+
+export interface FrontierRecord {
+  v: 1;
+  recordType: "frontier";
+  frontierId: string;
+  origin: string;
+  nodeIds: string[];
+  createdAt: string;
+}
+
+export type GraphRecord =
+  | SessionNodeRecord
+  | EdgeRecord
+  | AttachmentRecord
+  | DispositionRecord
+  | FrontierRecord;
+
+export interface GraphTransaction {
+  v: 1;
+  recordType: "transaction";
+  txId: string;
+  expectedGraphRevision?: string;
+  records: GraphRecord[];
+  createdAt: string;
+}
+
+export interface BackendRef {
   changeId: string;
   commitId: string;
-  parents: string[];
   timestamp: string;
-  manifest: NodeManifest | null;
 }
 
-export interface CommitNodeOpts {
-  parents?: string[];
-  manifest: NodeManifest;
-  /** Repo-relative path → content. Prefer objects/<sha>.jsonl for snapshots. */
-  files?: Record<string, string>;
+/** Materialized domain entity. backendRef is a locator, never its identity. */
+export interface SessionNode extends SessionNodeRecord {
+  backendRef: BackendRef;
 }
 
-export interface AmendNodeOpts {
-  changeId: string;
-  manifest: NodeManifest;
+export interface MaterializedEdge extends EdgeRecord {
+  backendRef: BackendRef;
+}
+
+export interface MaterializedAttachment extends AttachmentRecord {
+  backendRef: BackendRef;
+}
+
+export interface GroveGraph {
+  revision: string;
+  nodes: SessionNode[];
+  edges: MaterializedEdge[];
+  attachments: MaterializedAttachment[];
+  dispositions: DispositionRecord[];
+  frontiers: FrontierRecord[];
+}
+
+export interface GroveRevision extends BackendRef {
+  parents: string[];
+  transaction: GraphTransaction | null;
+}
+
+export interface GraphApplyOptions {
+  records: GraphRecord[];
   files?: Record<string, string>;
+  /** Only validated, repo-relative object paths may be removed. */
+  deleteFiles?: string[];
+  expectedGraphRevision?: string;
+}
+
+export interface GraphApplyResult {
+  transaction: GraphTransaction;
+  revision: GroveRevision;
+  graphRevision: string;
+}
+
+export interface AmendDraftOptions {
+  nodeId: string;
+  expectedRevision: number;
+  patch: Partial<
+    Pick<
+      SessionNodeRecord,
+      "label" | "snapshotId" | "anchor" | "capture" | "code" | "state" | "pinned" | "publishedAt"
+    >
+  >;
+  files?: Record<string, string>;
+  deleteFiles?: string[];
+  attachments?: AttachmentRecord[];
+  expectedGraphRevision?: string;
 }
 
 export interface TreeBackend {
   repoDir(): string;
   ensureRepo(): Promise<string>;
   currentChangeId(): Promise<string>;
-  /** Current jj operation id (for coordinator preOpId). */
   currentOperationId(): Promise<string>;
-  commitNode(opts: CommitNodeOpts): Promise<GroveNode>;
-  /** Update an existing mutable draft change in place. */
-  amendNode(opts: AmendNodeOpts): Promise<GroveNode>;
-  listNodes(): Promise<GroveNode[]>;
+  graphRevision(): Promise<string>;
+  applyGraphTransaction(opts: GraphApplyOptions): Promise<GraphApplyResult>;
+  getGraph(): Promise<GroveGraph>;
+  getNode(nodeId: string): Promise<SessionNode | null>;
+  recordNode(opts: {
+    node: SessionNodeRecord;
+    edges?: EdgeRecord[];
+    attachments?: AttachmentRecord[];
+    files?: Record<string, string>;
+    expectedGraphRevision?: string;
+  }): Promise<SessionNode>;
+  amendDraft(opts: AmendDraftOptions): Promise<SessionNode>;
+  appendEdge(opts: {
+    edge: EdgeRecord;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedEdge>;
+  deleteEdge(opts: {
+    edgeId: string;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedEdge>;
+  appendAttachment(opts: {
+    attachment: AttachmentRecord;
+    files?: Record<string, string>;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedAttachment>;
+  listRevisions(): Promise<GroveRevision[]>;
   showFile(rev: string, path: string): Promise<string | null>;
   edit(changeId: string): Promise<void>;
+  gotoNode(nodeId: string): Promise<void>;
   undo(): Promise<void>;
-  /** Restore repo to a prior operation (local only). */
   restoreOperation(opId: string): Promise<void>;
-  /** Set or create a bookmark pointing at a change. */
   setBookmark(name: string, changeId: string): Promise<void>;
   listBookmarks(): Promise<Array<{ name: string; changeId: string }>>;
-  /** Ensure a git remote exists (by name). */
   ensureRemote(name: string, url: string): Promise<void>;
   gitPush(opts: { remote: string; bookmark: string }): Promise<void>;
   gitFetch(opts: { remote: string }): Promise<void>;
 }
 
-/** Serialize a manifest as a single-line commit description. */
-export function encodeManifest(m: NodeManifest): string {
-  return JSON.stringify(m);
+const RECORD_TYPES = new Set(["node", "edge", "attachment", "disposition", "frontier"]);
+
+export function encodeTransaction(transaction: GraphTransaction): string {
+  return JSON.stringify(transaction);
 }
 
-/** Parse a current-format manifest from a commit description. */
-export function decodeManifest(description: string): NodeManifest | null {
+export function decodeTransaction(description: string): GraphTransaction | null {
   const trimmed = description.trim();
   if (!trimmed.startsWith("{")) return null;
   try {
@@ -147,26 +235,40 @@ export function decodeManifest(description: string): NodeManifest | null {
     if (
       !parsed ||
       parsed.v !== 1 ||
-      typeof parsed.kind !== "string" ||
-      !NODE_KINDS.has(parsed.kind) ||
-      typeof parsed.label !== "string" ||
-      typeof parsed.projectId !== "string" ||
-      typeof parsed.sessionId !== "string" ||
-      typeof parsed.lifecycle !== "string" ||
-      !NODE_LIFECYCLES.has(parsed.lifecycle) ||
-      !(parsed.snapshotId === null || typeof parsed.snapshotId === "string") ||
-      typeof parsed.anchor !== "object" ||
-      parsed.anchor === null ||
-      typeof parsed.project !== "object" ||
-      parsed.project === null ||
-      typeof parsed.origin !== "string" ||
-      typeof parsed.createdAt !== "string"
+      parsed.recordType !== "transaction" ||
+      typeof parsed.txId !== "string" ||
+      !Array.isArray(parsed.records) ||
+      typeof parsed.createdAt !== "string" ||
+      !parsed.records.every(
+        (record: unknown) =>
+          !!record &&
+          typeof record === "object" &&
+          (record as { v?: unknown }).v === 1 &&
+          RECORD_TYPES.has(String((record as { recordType?: unknown }).recordType)),
+      )
     ) {
       return null;
     }
-    return parsed as NodeManifest;
+    return parsed as GraphTransaction;
   } catch {
-    /* not grove JSON */
+    return null;
   }
-  return null;
+}
+
+export function isEffectivelySealed(node: SessionNodeRecord, edges: EdgeRecord[]): boolean {
+  return (
+    node.state === "sealed" ||
+    node.pinned ||
+    Boolean(node.publishedAt) ||
+    edges.some(
+      (edge) =>
+        edge.state === "active" &&
+        edge.kind === "lineage" &&
+        edge.fromNodeId === node.nodeId,
+    )
+  );
+}
+
+export function newDomainId(prefix: "node" | "edge" | "attachment" | "tx" | "disposition"): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }

@@ -26,29 +26,33 @@
 > 架构：ADR-0001 / ADR-0004。术语：CONTEXT.md。
 
 > **交接快照（2026-07-21）**
-> - **状态**：manifest v1 + coordinator + SessionAnchor + CAS snapshots + harness auto + 全功能 UI + sync/registry 骨架完成。
+> - **状态**：GraphTransaction v1 + SessionNode/Edge/Attachment + SessionAnchor +
+>   foreground outcome capture + RunLedger 协议 + sync/registry 骨架完成。
 > - **兼容策略**：首个发布前直接演进并 squash v1；发布后 v1 冻结为兼容边界。
 > - **验证**：`npm test`（grove + orchestrator）。
 > - **已知坑**：
 >   1. jj `description.first_line()` 取单行 JSON
->   2. fork 必须经 pending `forkFrom` intent，禁止猜父
+>   2. `nodeId != jj change-id`，semantic Edge 不能从 jj parents 推导
 >   3. 不要注册 `/tree`
->   4. sync 默认关闭；需 `.pi/grove.json` + private 确认
+>   4. Worker 不写 Grove；session entry 是 proposal 真源，EventBus 只是通知
+>   5. sync 默认关闭；需 `.pi/grove.json` + private 确认
 
 ### 2.1–2.4 基础骨架
 - [x] TreeBackend + jj-cli + `/grove` + 清理 project-tree
 
 ### 2.5 加固（ADR-0004）
-- [x] NodeManifest v1（projectId、snapshotId、SessionAnchor、lifecycle、forkFrom、mergeOf）
+- [x] GraphTransaction v1 + stable nodeId + typed Edge + immutable Attachment（ADR-0006）
 - [x] 内容寻址快照 `objects/<sha256>.jsonl` + 加强 redaction
 - [x] SessionAnchor capture/resolve（compaction 检测）
-- [x] OperationCoordinator（preOpId / receipt / logical undo）
-- [x] fork pending intent + forkFrom 父边
-- [x] harness：`agent_settled`/`agent_end` auto draft；替换启发式；`/grove auto keep|replace|split`
-- [x] 全功能 UI 键位与命令对等（goto/commit/fork/merge/pick/undo/auto/realign/sync/dashboard/pin）
+- [x] OperationCoordinator（preOpId / receipt / writer lock / optimistic revision / logical undo）
+- [x] fork pending intent + explicit parentNodeId/lineage Edge
+- [x] outcome harness：RunLedger proposal、settled/restart reconcile、sequence fencing、legacy fallback
+- [x] UI 使用 semantic graph；Build/Summary 作为 Attachment 展示
+- [x] 显式 graph API（goto nodeId、append/delete Edge、append Attachment、promote seam）
 - [x] sync：per-origin bookmark + frontier；privacy gate；`/grove sync config|push|pull`
 - [x] registry：本地 catalog + outbox + dashboard
-- [x] 测试覆盖
+- [x] 图模型、siblings、幂等、恢复、undo disposition、CAS replacement 测试
+- [x] 全屏 SessionGraph TUI：二维画布、semantic zoom、稳定配色、anchored thread overlay
 
 ---
 
@@ -67,4 +71,5 @@
 - [ ] manifest 的 code 字段从只读指针升级
 - [ ] checkpoint 联动代码提交（可选）
 - [ ] jj 作为项目 VCS 时拓扑对齐
-- [ ] orchestrator Build 成功后可选 `/grove commit` 联动
+- [x] orchestrator Build 成功后自动提出 execution outcome；foreground Grove 无感捕获
+- [ ] 完整节点编辑器（拖拽连线、outcome promotion、workspace 切换）

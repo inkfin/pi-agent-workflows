@@ -3,6 +3,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { newProtocolId } from "../../shared/outcomes";
 import {
   ASK_PLAN_TOOLS,
   BUILD_EXTRA_TOOLS,
@@ -18,6 +19,9 @@ import { canBuild, validatePlan } from "./plan";
 export class WorkflowController {
   mode: WorkflowMode = "auto";
   previousTools: string[] | undefined;
+  workItemId: string | undefined;
+  nextBuildSequence = 1;
+  pendingSummaryAttemptId: string | undefined;
   plan: ExecutionPlan | undefined;
   revisions: PlanRevisionRecord[] = [];
   build: BuildRunState | undefined;
@@ -29,6 +33,9 @@ export class WorkflowController {
     return {
       mode: this.mode,
       previousTools: this.previousTools,
+      workItemId: this.workItemId,
+      nextBuildSequence: this.nextBuildSequence,
+      pendingSummaryAttemptId: this.pendingSummaryAttemptId,
       plan: this.plan,
       revisions: this.revisions,
       build: this.build,
@@ -40,10 +47,62 @@ export class WorkflowController {
     if (!data) return;
     this.mode = data.mode ?? "auto";
     this.previousTools = data.previousTools;
+    this.workItemId = data.workItemId;
+    this.nextBuildSequence = Math.max(1, data.nextBuildSequence ?? 1);
+    this.pendingSummaryAttemptId = data.pendingSummaryAttemptId;
     this.plan = data.plan;
     this.revisions = data.revisions ?? [];
     this.build = data.build;
     this.lockedRevision = data.lockedRevision;
+    if (this.plan && !this.workItemId) this.workItemId = newProtocolId("work");
+  }
+
+  /** A module-scoped extension instance can serve several unrelated sessions. */
+  reset(): void {
+    this.mode = "auto";
+    this.previousTools = undefined;
+    this.workItemId = undefined;
+    this.nextBuildSequence = 1;
+    this.pendingSummaryAttemptId = undefined;
+    this.plan = undefined;
+    this.revisions = [];
+    this.build = undefined;
+    this.lockedRevision = undefined;
+    this.agentRunning = false;
+    this.abort?.abort();
+    this.abort = undefined;
+  }
+
+  /** Explicit `/plan <goal>` starts a new logical work lineage. */
+  startWorkItem(): string {
+    this.workItemId = newProtocolId("work");
+    this.nextBuildSequence = 1;
+    this.pendingSummaryAttemptId = undefined;
+    this.plan = undefined;
+    this.revisions = [];
+    this.build = undefined;
+    this.lockedRevision = undefined;
+    return this.workItemId;
+  }
+
+  beginBuildAttempt(base: {
+    baseNodeId: string | null;
+    baseCodeRevision: string | null;
+  }): {
+    workItemId: string;
+    buildAttemptId: string;
+    sequence: number;
+    baseNodeId: string | null;
+    baseCodeRevision: string | null;
+  } {
+    this.workItemId ??= newProtocolId("work");
+    const sequence = this.nextBuildSequence++;
+    return {
+      workItemId: this.workItemId,
+      buildAttemptId: newProtocolId("attempt"),
+      sequence,
+      ...base,
+    };
   }
 
   persist(pi: ExtensionAPI): void {
@@ -119,6 +178,7 @@ export class WorkflowController {
   }
 
   setPlan(plan: ExecutionPlan, diff: string): void {
+    this.workItemId ??= newProtocolId("work");
     this.plan = plan;
     this.revisions.push({
       revision: plan.revision,

@@ -19,6 +19,11 @@ export interface GroveProjectSettings {
   registry?: boolean;
   /** Enable harness auto snapshots (default true). */
   autoSnapshot?: boolean;
+  /**
+   * auto: consume Orchestrator outcomes when present, otherwise legacy dirty capture.
+   * outcome: semantic proposals only; legacy: dirty capture only; off: harness disabled.
+   */
+  trackingMode?: "auto" | "outcome" | "legacy" | "off";
 }
 
 export interface GroveLocalSettings {

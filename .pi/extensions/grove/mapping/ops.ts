@@ -1,16 +1,18 @@
 /**
- * grove/mapping/ops.ts — pi ↔ jj orchestration
+ * Pi session ↔ Grove semantic graph operations.
  */
 
 import * as path from "node:path";
 import type {
-  TreeBackend,
-  GroveNode,
-  NodeManifest,
+  AttachmentRecord,
+  EdgeRecord,
+  GroveGraph,
   SessionAnchor,
-  InjectStrategy,
-  ForkFrom,
+  SessionNode,
+  SessionNodeRecord,
+  TreeBackend,
 } from "../backend/types";
+import { isEffectivelySealed, newDomainId } from "../backend/types";
 import { machineId, projectInfo, codeState } from "../lib/identity";
 import {
   resolveSessionRef,
@@ -22,62 +24,124 @@ import {
 } from "../lib/sessions";
 import { buildSnapshotFromSession, snapshotPath, redact } from "../lib/snapshots";
 import { OperationCoordinator } from "./coordinator";
-import { loadJournal, saveJournal } from "../lib/journal";
 
 export { redact };
 
-function baseManifest(
+export interface ForkRef {
+  parentNodeId: string;
+  parentSessionId: string;
+  parentAnchor: SessionAnchor;
+}
+
+function nodeRecord(
   cwd: string,
-  kind: NodeManifest["kind"],
-  label: string,
-  sessionId: string,
-  anchor: SessionAnchor,
-  extra: Partial<NodeManifest> = {},
-): NodeManifest {
-  const proj = projectInfo(cwd);
+  opts: {
+    label: string;
+    sessionId: string;
+    anchor: SessionAnchor;
+    snapshotId: string | null;
+    source: SessionNodeRecord["capture"]["source"];
+    state?: SessionNodeRecord["state"];
+    pinned?: boolean;
+    slotId?: string;
+    eventId?: string;
+    sequence?: number;
+  },
+): SessionNodeRecord {
+  const project = projectInfo(cwd);
+  const now = new Date().toISOString();
   return {
     v: 1,
-    kind,
-    label,
-    projectId: proj.projectId,
-    sessionId,
-    snapshotId: extra.snapshotId ?? null,
-    anchor,
-    lifecycle: extra.lifecycle ?? (kind === "auto" ? "draft" : "pinned"),
-    project: { name: proj.name, vcsRemote: proj.vcsRemote },
+    recordType: "node",
+    nodeId: newDomainId("node"),
+    revision: 1,
+    label: opts.label,
+    projectId: project.projectId,
+    sessionId: opts.sessionId,
+    snapshotId: opts.snapshotId,
+    anchor: opts.anchor,
+    capture: {
+      source: opts.source,
+      slotId: opts.slotId,
+      latestEventId: opts.eventId,
+      sequence: opts.sequence,
+    },
+    state: opts.state ?? "draft",
+    pinned: opts.pinned ?? false,
+    project: { name: project.name, vcsRemote: project.vcsRemote },
     origin: machineId(),
     code: codeState(cwd),
-    createdAt: new Date().toISOString(),
-    ...extra,
+    createdAt: now,
+    updatedAt: now,
   };
+}
+
+export function lineageEdge(fromNodeId: string, toNodeId: string): EdgeRecord {
+  return {
+    v: 1,
+    recordType: "edge",
+    edgeId: newDomainId("edge"),
+    revision: 1,
+    fromNodeId,
+    toNodeId,
+    kind: "lineage",
+    state: "active",
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function currentNode(graph: GroveGraph, currentChangeId: string): SessionNode | undefined {
+  return graph.nodes.find((node) => node.backendRef.changeId === currentChangeId);
+}
+
+function latestSessionNode(graph: GroveGraph, sessionId: string): SessionNode | undefined {
+  return graph.nodes
+    .filter((node) => node.sessionId === sessionId)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+}
+
+async function baseNodeFor(
+  be: TreeBackend,
+  graph: GroveGraph,
+  sessionId: string,
+): Promise<SessionNode | undefined> {
+  return currentNode(graph, await be.currentChangeId()) ?? latestSessionNode(graph, sessionId);
 }
 
 export async function checkpointSession(
   be: TreeBackend,
   cwd: string,
   opts: { label: string; sessionFile: string; entryId: string | null },
-): Promise<GroveNode> {
-  const coord = new OperationCoordinator(be);
-  await coord.begin("checkpoint", { label: opts.label });
+): Promise<SessionNode> {
+  const coordinator = new OperationCoordinator(be);
+  await coordinator.begin("checkpoint", { label: opts.label });
   try {
     const sessionId = path.basename(opts.sessionFile);
     const anchor = captureAnchor(opts.sessionFile, opts.entryId);
-    const snap = buildSnapshotFromSession(opts.sessionFile);
-    const node = await be.commitNode({
-      manifest: baseManifest(cwd, "checkpoint", opts.label, sessionId, anchor, {
-        snapshotId: snap.snapshotId,
-        lifecycle: "pinned",
-      }),
-      files: snap.files,
+    const snapshot = buildSnapshotFromSession(opts.sessionFile);
+    const graph = await be.getGraph();
+    const base = await baseNodeFor(be, graph, sessionId);
+    const node = nodeRecord(cwd, {
+      label: opts.label,
+      sessionId,
+      anchor,
+      snapshotId: snapshot.snapshotId,
+      source: "manual",
+      state: "sealed",
+      pinned: true,
     });
-    await coord.succeed(node.changeId);
-    const j = loadJournal(be.repoDir());
-    j.lastAligned = { changeId: node.changeId, sessionId, anchor };
-    saveJournal(be.repoDir(), j);
-    return node;
-  } catch (err: any) {
-    await coord.failAndRestore(err?.message ?? String(err));
-    throw err;
+    const materialized = await be.recordNode({
+      node,
+      edges: base ? [lineageEdge(base.nodeId, node.nodeId)] : [],
+      files: snapshot.files,
+      expectedGraphRevision: graph.revision,
+    });
+    await coordinator.succeed(materialized.backendRef.changeId, materialized.nodeId);
+    coordinator.setAligned(materialized.nodeId, sessionId, anchor);
+    return materialized;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
   }
 }
 
@@ -87,248 +151,335 @@ export async function recordFork(
   opts: {
     sessionFile: string;
     entryId: string | null;
-    forkFrom: ForkFrom;
+    forkFrom: ForkRef;
     snapshotFile?: string;
   },
-): Promise<GroveNode> {
-  const coord = new OperationCoordinator(be);
-  await coord.begin("fork", { parent: opts.forkFrom.parentChangeId });
+): Promise<SessionNode> {
+  const coordinator = new OperationCoordinator(be);
+  await coordinator.begin("fork", { parentNodeId: opts.forkFrom.parentNodeId });
   try {
     const sessionId = path.basename(opts.sessionFile);
     const anchor = captureAnchor(opts.sessionFile, opts.entryId);
-    let files: Record<string, string> | undefined;
-    let snapshotId: string | null = null;
-    if (opts.snapshotFile) {
-      const snap = buildSnapshotFromSession(opts.snapshotFile);
-      files = snap.files;
-      snapshotId = snap.snapshotId;
+    const snapshot = opts.snapshotFile ? buildSnapshotFromSession(opts.snapshotFile) : undefined;
+    const graph = await be.getGraph();
+    if (!graph.nodes.some((node) => node.nodeId === opts.forkFrom.parentNodeId)) {
+      throw new Error(`grove: fork parent missing: ${opts.forkFrom.parentNodeId}`);
     }
-    const node = await be.commitNode({
-      parents: [opts.forkFrom.parentChangeId],
-      manifest: baseManifest(cwd, "fork", `fork: ${sessionId.replace(/\.jsonl$/, "")}`, sessionId, anchor, {
-        snapshotId,
-        forkFrom: opts.forkFrom,
-        lifecycle: "pinned",
-      }),
-      files,
+    const node = nodeRecord(cwd, {
+      label: `fork: ${sessionId.replace(/\.jsonl$/, "")}`,
+      sessionId,
+      anchor,
+      snapshotId: snapshot?.snapshotId ?? null,
+      source: "manual",
     });
-    await coord.succeed(node.changeId);
-    return node;
-  } catch (err: any) {
-    await coord.failAndRestore(err?.message ?? String(err));
-    throw err;
+    const materialized = await be.recordNode({
+      node,
+      edges: [lineageEdge(opts.forkFrom.parentNodeId, node.nodeId)],
+      files: snapshot?.files,
+      expectedGraphRevision: graph.revision,
+    });
+    await coordinator.succeed(materialized.backendRef.changeId, materialized.nodeId);
+    coordinator.setAligned(materialized.nodeId, sessionId, anchor);
+    return materialized;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
   }
 }
 
-export async function recordMerge(
+export async function recordContextInjection(
   be: TreeBackend,
   cwd: string,
   opts: {
     label: string;
     sessionFile: string;
-    source: GroveNode;
-    strategy?: InjectStrategy;
+    source: SessionNode;
     payload: string;
   },
-): Promise<GroveNode> {
-  const coord = new OperationCoordinator(be);
-  await coord.begin("merge", { source: opts.source.changeId });
+): Promise<SessionNode> {
+  const coordinator = new OperationCoordinator(be);
+  await coordinator.begin("merge", { sourceNodeId: opts.source.nodeId });
   try {
-    const current = await be.currentChangeId();
     const sessionId = path.basename(opts.sessionFile);
-    const sm = opts.source.manifest!;
-    const node = await be.commitNode({
-      parents: [current, opts.source.changeId],
-      manifest: baseManifest(cwd, "context_merge", opts.label, sessionId, { entryId: null }, {
-        lifecycle: "pinned",
-        injectStrategy: opts.strategy ?? "summary",
-        payloadHash: sha256(opts.payload).slice(0, 16),
-        mergeOf: [
-          {
-            changeId: opts.source.changeId,
-            label: sm.label,
-            sessionId: sm.sessionId,
-            anchor: sm.anchor,
-          },
-        ],
-      }),
+    const anchor = captureAnchor(opts.sessionFile, null);
+    const snapshot = buildSnapshotFromSession(opts.sessionFile);
+    const graph = await be.getGraph();
+    const base = await baseNodeFor(be, graph, sessionId);
+    const node = nodeRecord(cwd, {
+      label: opts.label,
+      sessionId,
+      anchor,
+      snapshotId: snapshot.snapshotId,
+      source: "manual",
     });
-    await coord.succeed(node.changeId);
-    return node;
-  } catch (err: any) {
-    await coord.failAndRestore(err?.message ?? String(err));
-    throw err;
+    const contentHash = sha256(opts.payload);
+    const payloadPath = `objects/${contentHash}.json`;
+    const attachment: AttachmentRecord = {
+      v: 1,
+      recordType: "attachment",
+      attachmentId: `attachment_context_${contentHash}`,
+      targetNodeId: node.nodeId,
+      kind: "context_injection",
+      producer: { extension: "grove", sourceId: opts.source.nodeId },
+      contentHash,
+      payloadPath,
+      createdAt: new Date().toISOString(),
+    };
+    const edges: EdgeRecord[] = [];
+    if (base) edges.push(lineageEdge(base.nodeId, node.nodeId));
+    edges.push({
+      v: 1,
+      recordType: "edge",
+      edgeId: newDomainId("edge"),
+      revision: 1,
+      fromNodeId: opts.source.nodeId,
+      toNodeId: node.nodeId,
+      kind: "context",
+      state: "active",
+      payloadHash: contentHash,
+      createdAt: new Date().toISOString(),
+    });
+    const materialized = await be.recordNode({
+      node,
+      edges,
+      attachments: [attachment],
+      files: { ...snapshot.files, [payloadPath]: JSON.stringify({ content: redact(opts.payload) }) },
+      expectedGraphRevision: graph.revision,
+    });
+    await coordinator.succeed(materialized.backendRef.changeId, materialized.nodeId);
+    coordinator.setAligned(materialized.nodeId, sessionId, anchor);
+    return materialized;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
   }
 }
 
-/** Create or amend an auto draft node after agent_settled. */
+/** Legacy dirty-worktree capture. Outcome capture uses mapping/capture.ts. */
+async function recordOrAmendAutoInner(
+  be: TreeBackend,
+  cwd: string,
+  opts: {
+    sessionFile: string;
+    entryId: string | null;
+    replaceNodeId?: string | null;
+    supersedesNodeId?: string | null;
+  },
+): Promise<SessionNode> {
+  const sessionId = path.basename(opts.sessionFile);
+  const anchor = captureAnchor(opts.sessionFile, opts.entryId);
+  const snapshot = buildSnapshotFromSession(opts.sessionFile);
+  const graph = await be.getGraph();
+
+  if (opts.replaceNodeId) {
+    const target = graph.nodes.find((node) => node.nodeId === opts.replaceNodeId);
+    if (target && canAutoAmend(graph, target.nodeId).ok) {
+      const oldPath = target.snapshotId ? snapshotPath(target.snapshotId) : undefined;
+      return be.amendDraft({
+        nodeId: target.nodeId,
+        expectedRevision: target.revision,
+        expectedGraphRevision: graph.revision,
+        patch: {
+          label: `auto ${new Date().toISOString().slice(0, 16)}`,
+          snapshotId: snapshot.snapshotId,
+          anchor,
+          code: codeState(cwd),
+          capture: {
+            ...target.capture,
+            sequence: (target.capture.sequence ?? 0) + 1,
+          },
+        },
+        files: snapshot.files,
+        deleteFiles: oldPath && oldPath !== snapshotPath(snapshot.snapshotId) ? [oldPath] : [],
+      });
+    }
+  }
+
+  const base = await baseNodeFor(be, graph, sessionId);
+  const node = nodeRecord(cwd, {
+    label: `auto ${new Date().toISOString().slice(0, 16)}`,
+    sessionId,
+    anchor,
+    snapshotId: snapshot.snapshotId,
+    source: "harness",
+    slotId: `legacy:${sessionId}:${base?.nodeId ?? "root"}`,
+    sequence: 1,
+  });
+  const edges: EdgeRecord[] = [];
+  if (base) edges.push(lineageEdge(base.nodeId, node.nodeId));
+  if (opts.supersedesNodeId) {
+    edges.push({
+      v: 1,
+      recordType: "edge",
+      edgeId: newDomainId("edge"),
+      revision: 1,
+      fromNodeId: opts.supersedesNodeId,
+      toNodeId: node.nodeId,
+      kind: "supersedes",
+      state: "active",
+      createdAt: new Date().toISOString(),
+    });
+  }
+  return be.recordNode({
+    node,
+    edges,
+    files: snapshot.files,
+    expectedGraphRevision: graph.revision,
+  });
+}
+
 export async function recordOrAmendAuto(
   be: TreeBackend,
   cwd: string,
   opts: {
     sessionFile: string;
     entryId: string | null;
-    replaceChangeId?: string | null;
-    supersedes?: string | null;
+    replaceNodeId?: string | null;
+    supersedesNodeId?: string | null;
   },
-): Promise<GroveNode> {
-  const sessionId = path.basename(opts.sessionFile);
-  const anchor = captureAnchor(opts.sessionFile, opts.entryId);
-  const snap = buildSnapshotFromSession(opts.sessionFile);
-  const code = codeState(cwd);
-  const nodes = await be.listNodes();
-
-  if (opts.replaceChangeId) {
-    const target = nodes.find((n) => n.changeId === opts.replaceChangeId);
-    const m = target?.manifest;
-    const hasChildren = nodes.some((n) => n.parents.includes(opts.replaceChangeId!));
-    if (
-      m &&
-      m.kind === "auto" &&
-      m.lifecycle === "draft" &&
-      !hasChildren
-    ) {
-      const coord = new OperationCoordinator(be);
-      await coord.begin("amend", { changeId: opts.replaceChangeId });
-      try {
-        const node = await be.amendNode({
-          changeId: opts.replaceChangeId,
-          manifest: {
-            ...m,
-            label: `auto ${new Date().toISOString().slice(0, 16)}`,
-            snapshotId: snap.snapshotId,
-            anchor,
-            code,
-            createdAt: new Date().toISOString(),
-            supersedes: opts.supersedes ?? m.supersedes,
-          },
-          files: snap.files,
-        });
-        await coord.succeed(node.changeId);
-        return node;
-      } catch (err: any) {
-        await coord.failAndRestore(err?.message ?? String(err));
-        throw err;
-      }
-    }
-  }
-
-  const coord = new OperationCoordinator(be);
-  await coord.begin("auto", {});
+): Promise<SessionNode> {
+  const coordinator = new OperationCoordinator(be);
+  await coordinator.begin("auto", {
+    replaceNodeId: opts.replaceNodeId,
+    supersedesNodeId: opts.supersedesNodeId,
+  }, path.basename(opts.sessionFile));
   try {
-    const node = await be.commitNode({
-      manifest: baseManifest(cwd, "auto", `auto ${new Date().toISOString().slice(0, 16)}`, sessionId, anchor, {
-        snapshotId: snap.snapshotId,
-        lifecycle: "draft",
-        supersedes: opts.supersedes ?? null,
-      }),
-      files: snap.files,
-    });
-    await coord.succeed(node.changeId);
+    const node = await recordOrAmendAutoInner(be, cwd, opts);
+    await coordinator.succeed(node.backendRef.changeId, node.nodeId);
     return node;
-  } catch (err: any) {
-    await coord.failAndRestore(err?.message ?? String(err));
-    throw err;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
   }
 }
 
-export async function pinNode(be: TreeBackend, changeId: string): Promise<GroveNode> {
-  const nodes = await be.listNodes();
-  const target = nodes.find((n) => n.changeId === changeId);
-  if (!target?.manifest) throw new Error(`Node not found: ${changeId}`);
-  const m = { ...target.manifest, lifecycle: "pinned" as const };
-  return be.amendNode({ changeId, manifest: m });
+export async function pinNode(be: TreeBackend, nodeId: string): Promise<SessionNode> {
+  const coordinator = new OperationCoordinator(be);
+  await coordinator.begin("pin", { nodeId });
+  try {
+  const graph = await be.getGraph();
+  const target = graph.nodes.find((node) => node.nodeId === nodeId);
+  if (!target) throw new Error(`Node not found: ${nodeId}`);
+  if (target.pinned) {
+    await coordinator.succeed(target.backendRef.changeId, target.nodeId);
+    return target;
+  }
+  const { backendRef: _backendRef, ...record } = target;
+  await be.applyGraphTransaction({
+    records: [{
+      ...record,
+      revision: target.revision + 1,
+      pinned: true,
+      updatedAt: new Date().toISOString(),
+    }],
+    expectedGraphRevision: graph.revision,
+  });
+    const node = (await be.getNode(nodeId))!;
+    await coordinator.succeed(node.backendRef.changeId, node.nodeId);
+    return node;
+  } catch (error: any) {
+    await coordinator.failAndRestore(error?.message ?? String(error));
+    throw error;
+  }
 }
 
 export async function ensureSessionAvailable(
   be: TreeBackend,
   cwd: string,
-  node: GroveNode,
-): Promise<{ path: string; materialized: boolean; anchorOk: boolean; anchorReason?: string } | null> {
-  const m = node.manifest;
-  if (!m) return null;
-  const local = resolveSessionRef(cwd, m.sessionId);
+  node: SessionNode,
+): Promise<{
+  path: string;
+  materialized: boolean;
+  anchorOk: boolean;
+  anchorEntryId: string | null;
+  anchorReason?: string;
+} | null> {
+  const local = resolveSessionRef(cwd, node.sessionId);
   if (local) {
-    const resolved = resolveAnchor(local, m.anchor);
-    if (resolved.ok) return { path: local, materialized: false, anchorOk: true };
-    // Fall through to snapshot materialize when anchor stale
-  }
-  if (!m.snapshotId) {
-    if (local) {
-      const resolved = resolveAnchor(local, m.anchor);
+    const resolved = resolveAnchor(local, node.anchor);
+    if (resolved.ok) {
       return {
         path: local,
         materialized: false,
-        anchorOk: resolved.ok,
-        anchorReason: resolved.ok ? undefined : resolved.reason,
+        anchorOk: true,
+        anchorEntryId: resolved.entryId,
       };
     }
-    return null;
   }
-  const snapshot = await be.showFile(node.changeId, snapshotPath(m.snapshotId));
-  // Also try tip of objects (may live in ancestor)
-  const content =
-    snapshot ??
-    (await be.showFile("@", snapshotPath(m.snapshotId))) ??
-    null;
-  if (content == null) return null;
-  const materializedPath = materializeSession(cwd, m.sessionId, content);
-  return { path: materializedPath, materialized: true, anchorOk: true };
+  if (!node.snapshotId) {
+    if (!local) return null;
+    const resolved = resolveAnchor(local, node.anchor);
+    return {
+      path: local,
+      materialized: false,
+      anchorOk: resolved.ok,
+      anchorEntryId: resolved.ok ? resolved.entryId : null,
+      anchorReason: resolved.ok ? undefined : resolved.reason,
+    };
+  }
+  const objectPath = snapshotPath(node.snapshotId);
+  const snapshot =
+    (await be.showFile(node.backendRef.changeId, objectPath)) ??
+    (await be.showFile("@", objectPath));
+  if (snapshot == null) return null;
+  const materializedPath = materializeSession(cwd, node.sessionId, snapshot);
+  const resolved = resolveAnchor(materializedPath, node.anchor);
+  return {
+    path: materializedPath,
+    materialized: true,
+    anchorOk: resolved.ok,
+    anchorEntryId: resolved.ok ? resolved.entryId : null,
+    anchorReason: resolved.ok ? undefined : resolved.reason,
+  };
 }
 
 export async function nodeSummaryForInject(
   be: TreeBackend,
-  node: GroveNode,
+  node: SessionNode,
   maxLen = 2000,
 ): Promise<string> {
-  const m = node.manifest;
-  if (!m) return "";
-  if (!m.snapshotId) return `(no snapshot for ${m.label})`;
+  if (!node.snapshotId) return `(no snapshot for ${node.label})`;
+  const objectPath = snapshotPath(node.snapshotId);
   const snapshot =
-    (await be.showFile(node.changeId, snapshotPath(m.snapshotId))) ??
-    (await be.showFile("@", snapshotPath(m.snapshotId)));
-  if (snapshot == null) return `(no snapshot available for ${m.label})`;
-  return summarizeSessionContent(snapshot, 12, maxLen);
+    (await be.showFile(node.backendRef.changeId, objectPath)) ??
+    (await be.showFile("@", objectPath));
+  return snapshot == null
+    ? `(no snapshot available for ${node.label})`
+    : summarizeSessionContent(snapshot, 12, maxLen);
 }
 
-export function nodeForSession(nodes: GroveNode[], sessionFile: string | null): GroveNode | undefined {
+export function nodeForSession(nodes: SessionNode[], sessionFile: string | null): SessionNode | undefined {
   if (!sessionFile) return undefined;
-  const ref = path.basename(sessionFile);
-  let best: GroveNode | undefined;
-  for (const n of nodes) {
-    if (n.manifest?.sessionId !== ref) continue;
-    if (!best || n.timestamp > best.timestamp) best = n;
-  }
-  return best;
+  const sessionId = path.basename(sessionFile);
+  return nodes
+    .filter((node) => node.sessionId === sessionId)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
 }
 
-export function nodeAtChange(nodes: GroveNode[], changeId: string): GroveNode | undefined {
-  return nodes.find((n) => n.changeId === changeId);
+export function nodeAtId(nodes: SessionNode[], nodeId: string): SessionNode | undefined {
+  return nodes.find((node) => node.nodeId === nodeId);
 }
 
-/** Nearest ancestor node on the same session before an anchor ordinal. */
 export function nearestParentNode(
-  nodes: GroveNode[],
+  graph: GroveGraph,
   sessionId: string,
   anchor: SessionAnchor,
-): GroveNode | undefined {
-  const same = nodes
-    .filter((n) => n.manifest?.sessionId === sessionId && n.manifest.kind !== "root")
-    .sort((a, b) => (a.manifest!.anchor.ordinal ?? -1) - (b.manifest!.anchor.ordinal ?? -1));
-  const ord = anchor.ordinal ?? Number.POSITIVE_INFINITY;
-  let best: GroveNode | undefined;
-  for (const n of same) {
-    const nOrd = n.manifest!.anchor.ordinal ?? -1;
-    if (nOrd <= ord) best = n;
-  }
-  return best;
+): SessionNode | undefined {
+  const ordinal = anchor.ordinal ?? Number.POSITIVE_INFINITY;
+  return graph.nodes
+    .filter((node) => node.sessionId === sessionId && (node.anchor.ordinal ?? -1) <= ordinal)
+    .sort((a, b) => (b.anchor.ordinal ?? -1) - (a.anchor.ordinal ?? -1))[0];
 }
 
-export function canAutoAmend(nodes: GroveNode[], changeId: string): { ok: true } | { ok: false; reason: string } {
-  const n = nodes.find((x) => x.changeId === changeId);
-  if (!n?.manifest) return { ok: false, reason: "node missing" };
-  if (n.manifest.kind !== "auto") return { ok: false, reason: "not an auto node" };
-  if (n.manifest.lifecycle !== "draft") return { ok: false, reason: `lifecycle is ${n.manifest.lifecycle}` };
-  if (nodes.some((c) => c.parents.includes(changeId))) return { ok: false, reason: "has children" };
+export function canAutoAmend(
+  graph: GroveGraph,
+  nodeId: string,
+): { ok: true } | { ok: false; reason: string } {
+  const node = graph.nodes.find((candidate) => candidate.nodeId === nodeId);
+  if (!node) return { ok: false, reason: "node missing" };
+  if (node.capture.source !== "harness" && node.capture.source !== "orchestrator") {
+    return { ok: false, reason: "not an automatic node" };
+  }
+  if (isEffectivelySealed(node, graph.edges)) return { ok: false, reason: "node is sealed" };
   return { ok: true };
 }

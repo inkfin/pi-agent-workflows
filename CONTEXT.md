@@ -40,18 +40,33 @@ A single pi conversation. Storage for turns; not itself a unit of the tree.
 One exchange within a session. Turns are ephemeral; most never become nodes.
 
 **Node**:
-A durable point in a project's session history: a checkpoint, fork, merge, auto, or frontier.
+A durable, navigable point in a project's session history. Its stable `nodeId` is
+independent from jj change-id. Build, Summary, checkpoint and fork are capture
+reasons or Attachments, not Node kinds.
 _Avoid_: branch
 
+**Edge**:
+An explicit `lineage`, `context`, or `supersedes` relationship between two Nodes.
+The semantic graph does not use jj commit parents as its topology.
+
+**Attachment**:
+An immutable, content-addressed outcome attached to a Node, such as an execution
+outcome, plan, decision, research report, or context injection.
+
+**RunLedger**:
+Orchestrator's append-only execution history. It retains successful, failed, and
+cancelled attempts; only accepted durable outcomes become Grove Nodes.
+
 **Checkpoint**:
-A Node explicitly named by the user to mark a position (always pinned).
+A manually captured, explicitly named Node (always pinned).
 
 **SessionAnchor**:
 A durable pointer into a pi session (`entryId`, `entryHash`, `ordinal`, `prefixHash`).
 Used for goto/fork recovery after compaction. Not related to the Cursor product.
 
 **Tree Repo**:
-The per-project store holding Nodes and content-addressed Session Snapshots.
+The per-project jj-backed store holding GraphTransactions and content-addressed
+Session Snapshots/Attachment payloads. jj topology is physical storage only.
 Its remote boundary equals the privacy/collaboration boundary.
 
 **Session Snapshot**:
@@ -63,16 +78,19 @@ The shared catalog of projects and sessions across machines. Metadata only; neve
 **Origin**:
 The machine where a Node was created. Provenance, not identity. Each origin owns one sync bookmark.
 
-**Lifecycle** (auto Nodes):
-`draft` → `pinned` → `published`. Only draft Nodes without children may be auto-amended.
+**Effective sealed**:
+A Node cannot be amended after it is explicitly sealed, pinned, published, or has
+an active outgoing lineage Edge. `pinned` represents user intent only.
 
 ## Relationships
 
 - A **Session** contains many **Turns**; only a few become **Nodes**
 - A **Node** belongs to exactly one **Tree Repo** and may reference one **Session Snapshot**
-- A **Node** records its **Origin** and a **SessionAnchor**
+- A **Node** records its **Origin** and a **SessionAnchor**; **Attachments** explain its outcomes
+- **Edges** define the user graph independently from the jj storage DAG
+- The **Orchestrator RunLedger** proposes outcomes; foreground Grove is the only Tree Repo writer
 - The **Registry** catalogs many **Tree Repos** but contains no **Session Snapshots**
-- The **Orchestrator** may create Grove checkpoints later; workers do not write Tree Repos
+- Workers never write Grove; accepted worktree outcomes can become sibling Nodes from an explicit base
 
 ## Key Decisions
 
@@ -81,11 +99,12 @@ The machine where a Node was created. Provenance, not identity. Each origin owns
 - Sync topology: per-project Tree Repos + central metadata Registry — [ADR-0002](docs/adr/0002-sync-topology-per-project-repos.md)
 - Not using Entire as backend — [ADR-0003](docs/adr/0003-not-using-entire-as-backend.md)
 - Grove schema, SessionAnchor, coordinator, harness auto, sync protocol — [ADR-0004](docs/adr/0004-grove-schema-and-consistency.md)
+- Grove SessionGraph, Attachments, RunLedger outcome protocol, and foreground single-writer — [ADR-0006](docs/adr/0006-grove-session-graph-and-outcomes.md)
 - Manifest schema is `v: 1`; until the first release it evolves in place, then becomes a compatibility boundary
 - Orchestrator Ask → Plan → Build with worktree-isolated edit workers — [ADR-0005](docs/adr/0005-orchestrator-ask-plan-build.md)
 - Sync stays explicit (triggered by user or agent command), never background-automatic
-- Conflicts surface as branches in the tree, not file-level merges
-- Merge strategy: context-inject (`context_merge`) — works across machines and projects
+- Graph conflicts surface as sibling Nodes or unapplied Edges, not silent overwrites
+- Context injection is an Attachment plus typed Edge; it never implies a code merge
 - `/grove` is the unified entry point; pi's built-in `/tree` stays untouched
 - Privacy: remotes must be private; sync default-off; a project may opt out of the Registry
 

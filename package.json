@@ -7,7 +7,9 @@
   ],
   "scripts": {
     "test": "node tests/grove-e2e.mjs && node tests/orchestrator-e2e.mjs",
-    "test:coverage": "c8 --all --check-coverage --lines 60 --functions 70 --branches 55 --reporter=text --reporter=json-summary --include='.pi/extensions/orchestrator/**/*.ts' node tests/orchestrator-e2e.mjs"
+    "test:coverage": "npm run test:coverage:orchestrator && npm run test:coverage:grove",
+    "test:coverage:orchestrator": "c8 --all --check-coverage --lines 60 --functions 70 --branches 55 --reporter=text --reporter=json-summary --include='.pi/extensions/orchestrator/**/*.ts' node tests/orchestrator-e2e.mjs",
+    "test:coverage:grove": "c8 --all --check-coverage --lines 60 --functions 65 --branches 55 --reporter=text --reporter=json-summary --include='.pi/extensions/grove/**/*.ts' --include='.pi/extensions/shared/outcomes.ts' node tests/grove-e2e.mjs"
   },
   "pi": {
     "extensions": [

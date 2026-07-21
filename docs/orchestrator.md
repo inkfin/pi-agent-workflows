@@ -81,6 +81,25 @@ dependency.
 The main tree must be clean before a plan containing edits starts. The
 orchestrator never stashes, resets, commits, or pushes the main branch.
 
+## RunLedger and Grove outcomes
+
+Each approved Build receives stable `workItemId` and `buildAttemptId`, plus the
+explicit `baseNodeId` and `baseCodeRevision` used by its workers. Orchestrator
+appends versioned `orchestrator-run` session entries for started and finished
+attempts, including failures and cancellation.
+
+After a successful final integration it appends execution-outcome and approved
+execution-plan `grove-attachment-proposal` entries. After the foreground agent
+reports completion, it adds a Summary proposal to the same slot. These durable
+session entries are the source of truth; the `grove:proposal-pending` EventBus
+event only prompts foreground Grove to rescan. Workers never load Grove or
+write its Tree Repo.
+
+Grove materializes the first accepted proposal for a slot as a generic
+SessionNode with an execution-outcome Attachment. Same-slot retries may amend
+that draft safely. Ordinary Ask/Plan dialogue and unselected worktree outcomes
+remain in RunLedger and do not create Grove nodes.
+
 ## Worker isolation
 
 Workers start with:
@@ -108,8 +127,9 @@ skills, prompts, and context files are not auto-loaded into workers.
 ## Verification
 
 - `npm test` runs Grove plus orchestrator regression tests.
-- `npm run test:coverage` measures every orchestrator TypeScript file and
-  enforces minimum 60% line, 70% function, and 55% branch coverage.
+- `npm run test:coverage` runs separate Orchestrator and Grove coverage gates.
+  Orchestrator enforces minimum 60% line, 70% function, and 55% branch coverage;
+  Grove enforces 60% line, 65% function, and 55% branch coverage.
 - The suite includes a real JSONL child process, SIGTERM-resistant
   cancellation, worker guard checks, untracked path-boundary checks, dependent
   edit worktrees, integration ordering, and post-integration review.

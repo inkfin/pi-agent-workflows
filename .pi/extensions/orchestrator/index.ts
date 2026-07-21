@@ -6,6 +6,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as path from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Key, Text } from "@earendil-works/pi-tui";
@@ -17,11 +18,231 @@ import { isSafeCommand } from "./lib/safe-commands";
 import { cleanupLeftovers, executePlan } from "./lib/scheduler";
 import { confirmBuild, updatePanel } from "./lib/ui";
 import { modeContractPrompt, notifyMode, WorkflowController } from "./lib/workflow";
-import { listLeftoverOrchWorktrees, gitRoot } from "./lib/worktree";
+import { currentHeadSha, listLeftoverOrchWorktrees, gitRoot } from "./lib/worktree";
+import {
+  contentHash,
+  GROVE_ATTACHMENT_PROPOSAL_ENTRY,
+  GROVE_PROPOSAL_PENDING_EVENT,
+  newProtocolId,
+  ORCHESTRATOR_RUN_ENTRY,
+  OUTCOME_PROTOCOL_VERSION,
+  outcomeSlotId,
+  type AttachmentProposal,
+  type BuildAttemptFinishedEvent,
+  type BuildAttemptStartedEvent,
+  type PlanRevisionRunEvent,
+  type RunEvent,
+} from "../shared/outcomes";
+import type { BuildRunState } from "./types";
+import { JjCliBackend } from "../grove/backend/jj-cli";
+import { projectInfo } from "../grove/lib/identity";
 
 const ctrl = new WorkflowController();
 let lastUiCtx: ExtensionContext | undefined;
 const approvedProjectAgentFiles = new Set<string>();
+const summarizedBuildAttempts = new Set<string>();
+
+function sessionId(ctx: ExtensionContext): string {
+  const manager = ctx.sessionManager as any;
+  const file = manager.getSessionFile?.();
+  return file ? path.basename(file) : String(manager.getSessionId?.() ?? "unsaved-session");
+}
+
+async function resolveBaseNodeId(ctx: ExtensionContext, entries: any[]): Promise<string | null> {
+  const groveStateTypes = new Set(["grove-state", "grove-current-node", "grove-node"]);
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.type !== "custom" || !groveStateTypes.has(entry.customType)) continue;
+    const id = entry.data?.currentNodeId ?? entry.data?.nodeId;
+    if (typeof id === "string" && id) return id;
+  }
+  try {
+    const backend = new JjCliBackend(ctx.cwd);
+    const [graph, currentChangeId] = await Promise.all([
+      backend.getGraph(),
+      backend.currentChangeId(),
+    ]);
+    const current = graph.nodes.find(
+      (node) => node.backendRef.changeId === currentChangeId,
+    );
+    if (current) return current.nodeId;
+    return (
+      graph.nodes
+        .filter((node) => node.sessionId === sessionId(ctx))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.nodeId ??
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function appendRunEvent(pi: ExtensionAPI, event: RunEvent): void {
+  pi.appendEntry(ORCHESTRATOR_RUN_ENTRY, event);
+}
+
+function durableBuildOutcome(build: BuildRunState) {
+  return {
+    workItemId: build.workItemId,
+    buildAttemptId: build.buildAttemptId,
+    sequence: build.sequence,
+    planRevision: build.planRevision,
+    status: build.status,
+    baseNodeId: build.baseNodeId,
+    baseCodeRevision: build.baseCodeRevision,
+    workspaceEffect: build.workspaceEffect,
+    startedAt: build.startedAt,
+    finishedAt: build.finishedAt,
+    integrateError: build.integrateError,
+    tasks: build.tasks.map((task) => ({
+      id: task.id,
+      status: task.status,
+      agent: task.agent,
+      kind: task.kind,
+      startedAt: task.startedAt,
+      finishedAt: task.finishedAt,
+      model: task.model,
+      baseCodeRevision: task.baseCodeRevision,
+      resultRevision: task.resultRevision,
+      summary: task.summary,
+      error: task.error,
+    })),
+  };
+}
+
+function proposalFor(
+  event: BuildAttemptFinishedEvent,
+  projectId: string,
+): AttachmentProposal {
+  const payload = event.outcome;
+  return {
+    v: OUTCOME_PROTOCOL_VERSION,
+    type: "attachment_proposal",
+    eventId: `event_${contentHash({
+      sourceEventId: event.eventId,
+      kind: "execution_outcome",
+    }).slice(0, 32)}`,
+    sourceEventId: event.eventId,
+    occurredAt: event.occurredAt,
+    sessionId: event.sessionId,
+    projectId,
+    slotId: outcomeSlotId(event),
+    workItemId: event.workItemId,
+    buildAttemptId: event.buildAttemptId,
+    planRevision: event.planRevision,
+    sequence: event.sequence,
+    baseNodeId: event.baseNodeId,
+    baseCodeRevision: event.baseCodeRevision,
+    kind: "execution_outcome",
+    producer: { extension: "orchestrator", sourceId: event.buildAttemptId },
+    contentHash: contentHash(payload),
+    payload,
+  };
+}
+
+function executionPlanProposal(
+  event: BuildAttemptFinishedEvent,
+  projectId: string,
+  plan: unknown,
+): AttachmentProposal {
+  const payload = plan;
+  return {
+    v: OUTCOME_PROTOCOL_VERSION,
+    type: "attachment_proposal",
+    eventId: `event_${contentHash({
+      buildAttemptId: event.buildAttemptId,
+      kind: "execution_plan",
+      payload,
+    }).slice(0, 32)}`,
+    sourceEventId: `plan:${event.buildAttemptId}`,
+    occurredAt: event.occurredAt,
+    sessionId: event.sessionId,
+    projectId,
+    slotId: outcomeSlotId(event),
+    workItemId: event.workItemId,
+    buildAttemptId: event.buildAttemptId,
+    planRevision: event.planRevision,
+    sequence: event.sequence,
+    baseNodeId: event.baseNodeId,
+    baseCodeRevision: event.baseCodeRevision,
+    kind: "execution_plan",
+    producer: { extension: "orchestrator", sourceId: event.buildAttemptId },
+    contentHash: contentHash(payload),
+    payload,
+  };
+}
+
+function appendProposal(pi: ExtensionAPI, proposal: AttachmentProposal): void {
+  // Durable session WAL first. EventBus is deliberately only a lossy hint.
+  pi.appendEntry(GROVE_ATTACHMENT_PROPOSAL_ENTRY, proposal);
+  try {
+    (pi as any).events?.emit?.(GROVE_PROPOSAL_PENDING_EVENT, {
+      v: OUTCOME_PROTOCOL_VERSION,
+      sessionId: proposal.sessionId,
+      eventId: proposal.eventId,
+    });
+  } catch {
+    /* a failed hint cannot invalidate the durable proposal */
+  }
+}
+
+function assistantSummary(messages: unknown[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index] as {
+      role?: string;
+      content?: string | Array<{ type?: string; text?: string }>;
+    };
+    if (message?.role !== "assistant") continue;
+    if (typeof message.content === "string" && message.content.trim()) {
+      return message.content.trim();
+    }
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .filter((item) => item?.type === "text" && typeof item.text === "string")
+        .map((item) => item.text!.trim())
+        .filter(Boolean)
+        .join("\n\n");
+      if (text) return text;
+    }
+  }
+  return null;
+}
+
+function summaryProposal(
+  build: BuildRunState,
+  ctx: ExtensionContext,
+  text: string,
+): AttachmentProposal {
+  const payload = { text };
+  return {
+    v: OUTCOME_PROTOCOL_VERSION,
+    type: "attachment_proposal",
+    eventId: `event_${contentHash({
+      buildAttemptId: build.buildAttemptId,
+      kind: "summary",
+      payload,
+    }).slice(0, 32)}`,
+    sourceEventId: `summary:${build.buildAttemptId}`,
+    occurredAt: new Date().toISOString(),
+    sessionId: sessionId(ctx),
+    projectId: projectInfo(ctx.cwd).projectId,
+    slotId: outcomeSlotId({
+      sessionId: sessionId(ctx),
+      baseNodeId: build.baseNodeId,
+      workItemId: build.workItemId,
+    }),
+    workItemId: build.workItemId,
+    buildAttemptId: build.buildAttemptId,
+    planRevision: build.planRevision,
+    sequence: build.sequence,
+    baseNodeId: build.baseNodeId,
+    baseCodeRevision: build.baseCodeRevision,
+    kind: "summary",
+    producer: { extension: "orchestrator", sourceId: build.buildAttemptId },
+    contentHash: contentHash(payload),
+    payload,
+  };
+}
 
 function refreshUi(ctx?: ExtensionContext): void {
   const c = ctx ?? lastUiCtx;
@@ -214,6 +435,18 @@ export default function (pi: ExtensionAPI) {
       const diff = planDiffSummary(ctrl.plan, next);
       ctrl.setPlan(next, diff);
       if (ctrl.mode !== "plan") ctrl.enterAskOrPlan(pi, "plan");
+      const planEvent: PlanRevisionRunEvent = {
+        v: OUTCOME_PROTOCOL_VERSION,
+        type: "plan_revision_published",
+        eventId: newProtocolId("event"),
+        occurredAt: next.createdAt,
+        sessionId: sessionId(ctx),
+        workItemId: ctrl.workItemId!,
+        planRevision: next.revision,
+        contentHash: contentHash(next),
+        plan: next,
+      };
+      appendRunEvent(pi, planEvent);
       ctrl.persist(pi);
       refreshUi(ctx);
       const gate = ctrl.buildGate();
@@ -377,30 +610,99 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(entered.reason ?? "Cannot enter Build", "error");
       return;
     }
+    const entries = ctx.sessionManager.getEntries() as any[];
+    const root = gitRoot(ctx.cwd);
+    const attempt = ctrl.beginBuildAttempt({
+      baseNodeId: await resolveBaseNodeId(ctx, entries),
+      baseCodeRevision: root ? currentHeadSha(root) : null,
+    });
+    const startedAt = new Date().toISOString();
+    ctrl.build = {
+      ...attempt,
+      planRevision: ctrl.plan!.revision,
+      status: "running",
+      workspaceEffect: "none",
+      startedAt,
+      tasks: ctrl.plan!.tasks.map((task) => ({
+        id: task.id,
+        status: "pending",
+        agent: task.agent,
+        kind: task.kind,
+      })),
+      leftoverWorktrees: [],
+    };
+    const startedEvent: BuildAttemptStartedEvent = {
+      v: OUTCOME_PROTOCOL_VERSION,
+      type: "build_attempt_started",
+      eventId: newProtocolId("event"),
+      occurredAt: startedAt,
+      sessionId: sessionId(ctx),
+      planRevision: ctrl.plan!.revision,
+      status: "running",
+      ...attempt,
+    };
+    appendRunEvent(pi, startedEvent);
     ctrl.persist(pi);
     refreshUi(ctx);
 
     ctrl.abort = new AbortController();
 
     ctx.ui.notify(`Building plan r${ctrl.plan!.revision}…`, "info");
-    const build = await executePlan({
-      cwd: ctx.cwd,
-      plan: ctrl.plan!,
-      config,
-      signal: ctrl.abort.signal,
-      hooks: {
-        onUpdate: (b) => {
-          ctrl.build = b;
-          refreshUi(ctx);
+    let build: BuildRunState;
+    try {
+      build = await executePlan({
+        cwd: ctx.cwd,
+        plan: ctrl.plan!,
+        config,
+        ...attempt,
+        signal: ctrl.abort.signal,
+        hooks: {
+          onUpdate: (b) => {
+            ctrl.build = b;
+            refreshUi(ctx);
+          },
+          resolveAgent: (name) => agents.find((a) => a.name === name),
+          researchTools: ["read", "grep", "find", "ls", "bash"],
+          editTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+          modelOverride: config.workerModel ?? currentModelPattern(ctx),
         },
-        resolveAgent: (name) => agents.find((a) => a.name === name),
-        researchTools: ["read", "grep", "find", "ls", "bash"],
-        editTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-        modelOverride: config.workerModel ?? currentModelPattern(ctx),
-      },
-    });
+      });
+    } catch (error: any) {
+      build = {
+        ...ctrl.build!,
+        status: ctrl.abort.signal.aborted ? "cancelled" : "failed",
+        finishedAt: new Date().toISOString(),
+        integrateError: error?.message ?? String(error),
+      };
+    }
     ctrl.build = build;
     ctrl.abort = undefined;
+    const finishedEvent: BuildAttemptFinishedEvent = {
+      v: OUTCOME_PROTOCOL_VERSION,
+      type: "build_attempt_finished",
+      eventId: newProtocolId("event"),
+      occurredAt: build.finishedAt ?? new Date().toISOString(),
+      sessionId: startedEvent.sessionId,
+      workItemId: build.workItemId,
+      buildAttemptId: build.buildAttemptId,
+      planRevision: build.planRevision,
+      sequence: build.sequence,
+      baseNodeId: build.baseNodeId,
+      baseCodeRevision: build.baseCodeRevision,
+      status: build.status === "idle" || build.status === "running" ? "failed" : build.status,
+      workspaceEffect: build.workspaceEffect,
+      outcome: durableBuildOutcome(build),
+      error: build.integrateError,
+    };
+    appendRunEvent(pi, finishedEvent);
+    if (finishedEvent.status === "succeeded") {
+      const projectId = projectInfo(ctx.cwd).projectId;
+      appendProposal(pi, proposalFor(finishedEvent, projectId));
+      appendProposal(pi, executionPlanProposal(finishedEvent, projectId, ctrl.plan));
+      ctrl.pendingSummaryAttemptId = finishedEvent.buildAttemptId;
+    } else {
+      ctrl.pendingSummaryAttemptId = undefined;
+    }
     ctrl.persist(pi);
     refreshUi(ctx);
 
@@ -445,17 +747,18 @@ export default function (pi: ExtensionAPI) {
     description: "Enter Plan mode (read-only). Optional goal starts a turn.",
     handler: async (args, ctx) => {
       lastUiCtx = ctx;
+      const goal = args.trim();
+      if (goal) ctrl.startWorkItem();
       ctrl.enterAskOrPlan(pi, "plan");
       applyPreferredModel(pi, ctx);
       ctrl.persist(pi);
       refreshUi(ctx);
       notifyMode(ctx, "plan");
-      const goal = args.trim();
       if (goal) {
         pi.sendMessage(
           {
             customType: "orchestrator-plan-goal",
-            content: `Create or revise an implementation plan for:\n\n${goal}\n\nExplore as needed, ask clarifying questions, then call submit_plan.`,
+            content: `Create an implementation plan for this new work item:\n\n${goal}\n\nExplore as needed, ask clarifying questions, then call submit_plan.`,
             display: true,
           },
           { triggerTurn: true },
@@ -695,7 +998,20 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     lastUiCtx = ctx;
-    const entries = ctx.sessionManager.getEntries();
+    ctrl.reset();
+    approvedProjectAgentFiles.clear();
+    summarizedBuildAttempts.clear();
+    const entries = ctx.sessionManager.getEntries() as any[];
+    for (const entry of entries) {
+      if (
+        entry?.type === "custom" &&
+        entry.customType === GROVE_ATTACHMENT_PROPOSAL_ENTRY &&
+        entry.data?.kind === "summary" &&
+        typeof entry.data?.buildAttemptId === "string"
+      ) {
+        summarizedBuildAttempts.add(entry.data.buildAttemptId);
+      }
+    }
     const stateEntry = [...entries]
       .reverse()
       .find((e: any) => e.type === "custom" && e.customType === "orchestrator-state") as
@@ -723,6 +1039,125 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+    if (
+      ctrl.pendingSummaryAttemptId &&
+      summarizedBuildAttempts.has(ctrl.pendingSummaryAttemptId)
+    ) {
+      ctrl.pendingSummaryAttemptId = undefined;
+    }
+    const runEvents = entries
+      .filter(
+        (entry: any) =>
+          entry?.type === "custom" &&
+          entry.customType === ORCHESTRATOR_RUN_ENTRY &&
+          entry.data?.v === OUTCOME_PROTOCOL_VERSION,
+      )
+      .map((entry: any) => entry.data as RunEvent);
+    const buildEvents = runEvents.filter(
+      (event): event is BuildAttemptStartedEvent | BuildAttemptFinishedEvent =>
+        event.type === "build_attempt_started" || event.type === "build_attempt_finished",
+    );
+    if (runEvents.length) {
+      const latest = runEvents[runEvents.length - 1];
+      ctrl.workItemId ??= latest.workItemId;
+      ctrl.nextBuildSequence = Math.max(
+        ctrl.nextBuildSequence,
+        ...buildEvents.map((event) => event.sequence + 1),
+      );
+    }
+
+    // A started event without a terminal event represents an interrupted
+    // process. Close it append-only on recovery instead of rewriting history.
+    const finishedAttempts = new Set(
+      buildEvents
+        .filter((event) => event.type === "build_attempt_finished")
+        .map((event) => event.buildAttemptId),
+    );
+    for (const event of buildEvents) {
+      if (event.type !== "build_attempt_started" || finishedAttempts.has(event.buildAttemptId)) {
+        continue;
+      }
+      const finishedAt = new Date().toISOString();
+      const recovered: BuildAttemptFinishedEvent = {
+        ...event,
+        type: "build_attempt_finished",
+        eventId: newProtocolId("event"),
+        occurredAt: finishedAt,
+        status: "cancelled",
+        workspaceEffect: "none",
+        outcome: {
+          workItemId: event.workItemId,
+          buildAttemptId: event.buildAttemptId,
+          sequence: event.sequence,
+          planRevision: event.planRevision,
+          status: "cancelled",
+          baseNodeId: event.baseNodeId,
+          baseCodeRevision: event.baseCodeRevision,
+          workspaceEffect: "none",
+          startedAt: event.occurredAt,
+          finishedAt,
+          tasks: [],
+          integrateError: "Interrupted before a terminal event was recorded.",
+        },
+        error: "Interrupted before a terminal event was recorded.",
+      };
+      appendRunEvent(pi, recovered);
+      runEvents.push(recovered);
+      finishedAttempts.add(event.buildAttemptId);
+    }
+
+    // Recreate a proposal if a prior process durably recorded success but
+    // stopped between the finished event and proposal append.
+    const proposedSources = new Set(
+      entries
+        .filter(
+          (entry: any) =>
+            entry?.type === "custom" &&
+            entry.customType === GROVE_ATTACHMENT_PROPOSAL_ENTRY,
+        )
+        .map((entry: any) => entry.data?.sourceEventId)
+        .filter(Boolean),
+    );
+    const proposedKinds = new Set(
+      entries
+        .filter(
+          (entry: any) =>
+            entry?.type === "custom" &&
+            entry.customType === GROVE_ATTACHMENT_PROPOSAL_ENTRY,
+        )
+        .map((entry: any) => `${entry.data?.kind}:${entry.data?.buildAttemptId}`),
+    );
+    const planEvents = runEvents.filter(
+      (event): event is PlanRevisionRunEvent => event.type === "plan_revision_published",
+    );
+    for (const event of runEvents) {
+      if (
+        event.type === "build_attempt_finished" &&
+        event.status === "succeeded" &&
+        !proposedSources.has(event.eventId)
+      ) {
+        appendProposal(pi, proposalFor(event, projectInfo(ctx.cwd).projectId));
+        proposedSources.add(event.eventId);
+      }
+      if (
+        event.type === "build_attempt_finished" &&
+        event.status === "succeeded" &&
+        !proposedKinds.has(`execution_plan:${event.buildAttemptId}`)
+      ) {
+        const planEvent = [...planEvents].reverse().find(
+          (candidate) =>
+            candidate.workItemId === event.workItemId &&
+            candidate.planRevision === event.planRevision,
+        );
+        if (planEvent) {
+          appendProposal(
+            pi,
+            executionPlanProposal(event, projectInfo(ctx.cwd).projectId, planEvent.plan),
+          );
+          proposedKinds.add(`execution_plan:${event.buildAttemptId}`);
+        }
+      }
+    }
     // Ensure tools registered are activatable in auto
     const active = pi.getActiveTools();
     pi.setActiveTools([...new Set([...active, "set_workflow_mode", "submit_plan", "dispatch_research"])]);
@@ -739,9 +1174,21 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     lastUiCtx = ctx;
     ctrl.agentRunning = false;
+    if (
+      ctrl.build?.status === "succeeded" &&
+      ctrl.pendingSummaryAttemptId === ctrl.build.buildAttemptId &&
+      !summarizedBuildAttempts.has(ctrl.build.buildAttemptId)
+    ) {
+      const summary = assistantSummary(event.messages as unknown[]);
+      if (summary) {
+        appendProposal(pi, summaryProposal(ctrl.build, ctx, summary));
+        summarizedBuildAttempts.add(ctrl.build.buildAttemptId);
+        ctrl.pendingSummaryAttemptId = undefined;
+      }
+    }
     ctrl.persist(pi);
     refreshUi(ctx);
   });

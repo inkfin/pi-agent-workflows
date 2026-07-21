@@ -42,7 +42,35 @@ const scheduler = await jiti.import(path.join(ORCH, "lib", "scheduler.ts"));
 const workerGuard = await jiti.import(path.join(ORCH, "worker-guard.ts"));
 const configMod = await jiti.import(path.join(ORCH, "lib", "config.ts"));
 const uiMod = await jiti.import(path.join(ORCH, "lib", "ui.ts"));
+const outcomes = await jiti.import(path.join(ROOT, ".pi", "extensions", "shared", "outcomes.ts"));
 const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
+
+// ── outcome protocol identity ──────────────────────────────
+{
+  const workItemId = outcomes.newProtocolId("work");
+  const attemptId = outcomes.newProtocolId("attempt");
+  assert.notEqual(workItemId, outcomes.newProtocolId("work"));
+  assert.notEqual(attemptId, outcomes.newProtocolId("attempt"));
+  assert.equal(
+    outcomes.contentHash({ b: 2, a: { d: 4, c: 3 } }),
+    outcomes.contentHash({ a: { c: 3, d: 4 }, b: 2 }),
+  );
+  assert.equal(outcomes.canonicalJson(undefined), "null");
+  const slot = outcomes.outcomeSlotId({
+    sessionId: "session.jsonl",
+    baseNodeId: "node-1",
+    workItemId,
+  });
+  assert.equal(
+    slot,
+    outcomes.outcomeSlotId({
+      workItemId,
+      baseNodeId: "node-1",
+      sessionId: "session.jsonl",
+    }),
+  );
+  ok("outcome protocol has stable canonical identity");
+}
 
 // ── plan validation ────────────────────────────────────────
 {
@@ -230,6 +258,17 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
   ctrl.agentRunning = true;
   assert.equal(ctrl.buildGate().ok, false);
   ctrl.agentRunning = false;
+  const firstAttempt = ctrl.beginBuildAttempt({
+    baseNodeId: "node-1",
+    baseCodeRevision: "abc",
+  });
+  const retryAttempt = ctrl.beginBuildAttempt({
+    baseNodeId: "node-1",
+    baseCodeRevision: "abc",
+  });
+  assert.equal(firstAttempt.workItemId, retryAttempt.workItemId);
+  assert.notEqual(firstAttempt.buildAttemptId, retryAttempt.buildAttemptId);
+  assert.equal(retryAttempt.sequence, firstAttempt.sequence + 1);
 
   // Fake pi for mode transitions
   let active = ["read", "bash", "edit", "write"];
@@ -256,6 +295,15 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
     rejected = true;
   }
   assert.equal(rejected, false);
+  ctrl.reset();
+  assert.equal(ctrl.mode, "auto");
+  assert.equal(ctrl.plan, undefined);
+  assert.equal(ctrl.workItemId, undefined);
+  assert.equal(ctrl.nextBuildSequence, 1);
+  const newWork = ctrl.startWorkItem();
+  assert.ok(newWork.startsWith("work_"));
+  assert.equal(ctrl.workItemId, newWork);
+  assert.equal(ctrl.revisions.length, 0);
   ok("workflow ask/plan tightens tools; build restores writes");
 }
 
@@ -307,6 +355,7 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
   const hooks = new Map();
   const shortcuts = [];
   const entries = [];
+  const protocolOrder = [];
   let activeTools = ["read", "bash", "edit", "write"];
   const fakePi = {
     registerTool(tool) { tools.push(tool); },
@@ -320,7 +369,15 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
     },
     getActiveTools() { return activeTools; },
     setActiveTools(next) { activeTools = next; },
-    appendEntry(type, data) { entries.push({ type: "custom", customType: type, data }); },
+    appendEntry(type, data) {
+      protocolOrder.push(`append:${type}`);
+      entries.push({ type: "custom", customType: type, data });
+    },
+    events: {
+      emit(name, data) {
+        protocolOrder.push(`emit:${name}:${data.eventId}`);
+      },
+    },
     sendMessage() {},
     sendUserMessage() {},
     setModel: async () => true,
@@ -333,7 +390,10 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
     hasUI: true,
     model: { provider: "fake", id: "foreground" },
     modelRegistry: { find: () => undefined },
-    sessionManager: { getEntries: () => entries },
+    sessionManager: {
+      getEntries: () => entries,
+      getSessionFile: () => path.join(ROOT, "test-session.jsonl"),
+    },
     ui: {
       theme: {
         fg: (_color, text) => text,
@@ -358,6 +418,7 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
   assert.ok(commands.has("build"));
   assert.ok(commands.has("orchestrator"));
   assert.equal(shortcuts[0].key, "ctrl-alt-b");
+  await hooks.get("session_start")[0]({}, ctx);
 
   const modeTool = tools.find((tool) => tool.name === "set_workflow_mode");
   const askResult = await modeTool.execute(
@@ -402,10 +463,151 @@ const orchestratorModule = await jiti.import(path.join(ORCH, "index.ts"));
   );
   assert.equal(submitted.details.buildReady, true);
   assert.ok(widgets.has("orchestrator-plan"));
+  const planRunEvent = entries.find(
+    (entry) =>
+      entry.customType === outcomes.ORCHESTRATOR_RUN_ENTRY &&
+      entry.data.type === "plan_revision_published",
+  );
+  assert.equal(planRunEvent.data.planRevision, 1);
+  assert.equal(planRunEvent.data.contentHash, outcomes.contentHash(planRunEvent.data.plan));
 
   await hooks.get("before_agent_start")[0]({ systemPrompt: "base" }, ctx);
   await hooks.get("agent_end")[0]({}, ctx);
   assert.ok(entries.some((entry) => entry.customType === "orchestrator-state"));
+
+  // Recovery closes interrupted attempts and recreates a missing successful
+  // proposal from the append-only run ledger.
+  entries.splice(0);
+  protocolOrder.splice(0);
+  const runBase = {
+    v: outcomes.OUTCOME_PROTOCOL_VERSION,
+    sessionId: "test-session.jsonl",
+    workItemId: "work-recovery",
+    planRevision: 2,
+    sequence: 1,
+    baseNodeId: "node-base",
+    baseCodeRevision: "abc123",
+  };
+  entries.push({
+    type: "custom",
+    customType: outcomes.ORCHESTRATOR_RUN_ENTRY,
+    data: {
+      ...runBase,
+      type: "build_attempt_started",
+      eventId: "event-interrupted-start",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      buildAttemptId: "attempt-interrupted",
+      status: "running",
+    },
+  });
+  const successfulOutcome = {
+    ...runBase,
+    buildAttemptId: "attempt-success",
+    status: "succeeded",
+    workspaceEffect: "none",
+    tasks: [],
+    leftoverWorktrees: [],
+  };
+  entries.push({
+    type: "custom",
+    customType: outcomes.ORCHESTRATOR_RUN_ENTRY,
+    data: {
+      ...runBase,
+      type: "build_attempt_finished",
+      eventId: "event-success-finished",
+      occurredAt: "2026-01-01T00:01:00.000Z",
+      buildAttemptId: "attempt-success",
+      status: "succeeded",
+      workspaceEffect: "none",
+      outcome: successfulOutcome,
+    },
+  });
+  await hooks.get("session_start")[0]({}, ctx);
+  const recoveredFinish = entries.find(
+    (entry) =>
+      entry.customType === outcomes.ORCHESTRATOR_RUN_ENTRY &&
+      entry.data.type === "build_attempt_finished" &&
+      entry.data.buildAttemptId === "attempt-interrupted",
+  );
+  assert.equal(recoveredFinish.data.status, "cancelled");
+  const proposals = entries.filter(
+    (entry) => entry.customType === outcomes.GROVE_ATTACHMENT_PROPOSAL_ENTRY,
+  );
+  assert.equal(proposals.length, 1);
+  assert.equal(proposals[0].data.sourceEventId, "event-success-finished");
+  assert.equal(proposals[0].data.kind, "execution_outcome");
+  assert.equal(proposals[0].data.baseNodeId, "node-base");
+  assert.equal(proposals[0].data.sequence, 1);
+  assert.equal(
+    proposals[0].data.contentHash,
+    outcomes.contentHash(successfulOutcome),
+  );
+  const appendIndex = protocolOrder.findIndex(
+    (item) => item === `append:${outcomes.GROVE_ATTACHMENT_PROPOSAL_ENTRY}`,
+  );
+  const emitIndex = protocolOrder.findIndex((item) =>
+    item.startsWith(`emit:${outcomes.GROVE_PROPOSAL_PENDING_EVENT}:`),
+  );
+  assert.ok(appendIndex >= 0 && emitIndex > appendIndex);
+  await hooks.get("session_start")[0]({}, ctx);
+  assert.equal(
+    entries.filter(
+      (entry) => entry.customType === outcomes.GROVE_ATTACHMENT_PROPOSAL_ENTRY,
+    ).length,
+    1,
+  );
+  entries.push({
+    type: "custom",
+    customType: "orchestrator-state",
+    data: {
+      mode: "auto",
+      revisions: [],
+      workItemId: successfulOutcome.workItemId,
+      nextBuildSequence: 2,
+      pendingSummaryAttemptId: "attempt-success",
+      build: {
+        ...successfulOutcome,
+        planRevision: 2,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        finishedAt: "2026-01-01T00:01:00.000Z",
+      },
+    },
+  });
+  await hooks.get("session_start")[0]({}, ctx);
+  await hooks.get("agent_end")[0](
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Implemented and verified the build." }],
+        },
+      ],
+    },
+    ctx,
+  );
+  assert.equal(
+    entries.filter(
+      (entry) =>
+        entry.customType === outcomes.GROVE_ATTACHMENT_PROPOSAL_ENTRY &&
+        entry.data.kind === "summary",
+    ).length,
+    1,
+  );
+  await hooks.get("agent_end")[0]({ messages: [] }, ctx);
+  assert.equal(
+    entries.filter(
+      (entry) =>
+        entry.customType === outcomes.GROVE_ATTACHMENT_PROPOSAL_ENTRY &&
+        entry.data.kind === "summary",
+    ).length,
+    1,
+  );
+  const freshContract = await hooks.get("before_agent_start")[0](
+    { systemPrompt: "base" },
+    ctx,
+  );
+  assert.ok(freshContract.systemPrompt.includes("ORCHESTRATOR MODE: AUTO"));
+  assert.ok(freshContract.systemPrompt.includes("No plan artifact yet."));
   ok("extension registers tools, commands, mode gate, hooks, and shortcut");
 }
 
@@ -700,6 +902,11 @@ setInterval(() => {}, 1000);
   const result = await scheduler.executePlan({
     cwd: repo,
     plan: executionPlan,
+    workItemId: "work-scheduler",
+    buildAttemptId: "attempt-scheduler-1",
+    sequence: 1,
+    baseNodeId: "node-scheduler",
+    baseCodeRevision: worktree.currentHeadSha(repo),
     config: {
       maxParallel: 2,
       maxTasks: 8,
@@ -718,7 +925,64 @@ setInterval(() => {}, 1000);
   assert.equal(fs.readFileSync(path.join(repo, "a.ts"), "utf-8"), "a2\n");
   assert.equal(fs.readFileSync(path.join(repo, "b.ts"), "utf-8"), "b2\n");
   assert.ok(seen.find((item) => item.task.includes("REVIEW")));
+  assert.equal(result.workItemId, "work-scheduler");
+  assert.equal(result.buildAttemptId, "attempt-scheduler-1");
+  assert.equal(result.baseNodeId, "node-scheduler");
+  assert.equal(result.workspaceEffect, "applied");
+  const editAState = result.tasks.find((task) => task.id === "edit-a");
+  const editBState = result.tasks.find((task) => task.id === "edit-b");
+  assert.equal(editAState.baseCodeRevision, result.baseCodeRevision);
+  assert.notEqual(editBState.baseCodeRevision, result.baseCodeRevision);
+  assert.ok(editAState.resultRevision);
+  assert.ok(editBState.resultRevision);
+  assert.ok(
+    seen.every((item) =>
+      item.task.includes("workItemId: work-scheduler") &&
+      item.task.includes("Never access or write Grove state"),
+    ),
+  );
   ok("scheduler carries edit dependencies and reviews integrated main changes");
+
+  // If a post-integration check fails, the main workspace is already changed
+  // and the ledger-facing state must say so.
+  execFileSync("git", ["restore", "."], { cwd: repo });
+  const failedReviewResult = await scheduler.executePlan({
+    cwd: repo,
+    plan: executionPlan,
+    workItemId: "work-scheduler",
+    buildAttemptId: "attempt-scheduler-2",
+    sequence: 2,
+    baseNodeId: "node-scheduler",
+    baseCodeRevision: worktree.currentHeadSha(repo),
+    config: {
+      maxParallel: 2,
+      maxTasks: 8,
+      taskTimeoutMs: 5_000,
+      agentScope: "builtin",
+    },
+    hooks: {
+      onUpdate: () => {},
+      resolveAgent: (name) => builtinAgents.find((agent) => agent.name === name),
+      researchTools: ["read"],
+      editTools: ["read", "edit", "write"],
+      runAgent: async (opts) => {
+        const result = await fakeRunAgent(opts);
+        if (opts.task.includes("REVIEW")) {
+          return {
+            ...result,
+            exitCode: 1,
+            stopReason: "error",
+            errorMessage: "review failed",
+          };
+        }
+        return result;
+      },
+    },
+  });
+  assert.equal(failedReviewResult.status, "failed");
+  assert.equal(failedReviewResult.workspaceEffect, "applied");
+  assert.equal(fs.readFileSync(path.join(repo, "a.ts"), "utf-8"), "a2\n");
+  ok("scheduler records applied workspace on post-integration failure");
 }
 
 console.log(`\n${passed} passed`);

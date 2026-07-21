@@ -45,13 +45,24 @@ export async function executePlan(opts: {
   cwd: string;
   plan: ExecutionPlan;
   config: OrchestratorConfig;
+  workItemId: string;
+  buildAttemptId: string;
+  sequence: number;
+  baseNodeId: string | null;
+  baseCodeRevision: string | null;
   signal?: AbortSignal;
   hooks: SchedulerHooks;
 }): Promise<BuildRunState> {
-  const runId = `${Date.now().toString(36)}`;
+  const runId = opts.buildAttemptId;
   const build: BuildRunState = {
+    workItemId: opts.workItemId,
+    buildAttemptId: opts.buildAttemptId,
+    sequence: opts.sequence,
     planRevision: opts.plan.revision,
     status: "running",
+    baseNodeId: opts.baseNodeId,
+    baseCodeRevision: opts.baseCodeRevision,
+    workspaceEffect: "none",
     startedAt: new Date().toISOString(),
     tasks: opts.plan.tasks.map(taskState),
     leftoverWorktrees: [],
@@ -144,6 +155,7 @@ export async function executePlan(opts: {
         return;
       }
     }
+    ts.baseCodeRevision = taskBaseSha;
 
     const tools =
       task.kind === "edit"
@@ -158,6 +170,14 @@ export async function executePlan(opts: {
         agent: { ...agent, tools },
         task: [
           task.goal,
+          [
+            "\nExecution identity (read-only metadata):",
+            `workItemId: ${opts.workItemId}`,
+            `buildAttemptId: ${opts.buildAttemptId}`,
+            `baseNodeId: ${opts.baseNodeId ?? "(none)"}`,
+            `baseCodeRevision: ${taskBaseSha}`,
+            "Never access or write Grove state; return results only to the foreground Orchestrator.",
+          ].join("\n"),
           task.kind === "edit"
             ? `\nYou may only modify these paths:\n${task.allowedPaths.map((p) => `- ${p}`).join("\n")}`
             : "\nRead-only investigation. Do not modify files.",
@@ -216,6 +236,7 @@ export async function executePlan(opts: {
       const committed = commitWorktreeChanges(slot.path, `pi-orch: ${task.id}`);
       if (committed.committed && committed.sha) {
         commits.push({ taskId: task.id, sha: committed.sha });
+        ts.resultRevision = committed.sha;
       }
     }
 
@@ -335,6 +356,7 @@ export async function executePlan(opts: {
         emit();
         return build;
       }
+      build.workspaceEffect = "applied";
       cleanupOrchResources(root, slots, integrate);
     } catch (err: any) {
       build.status = "failed";

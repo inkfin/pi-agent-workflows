@@ -1,11 +1,14 @@
 /**
- * grove/mapping/harness.ts — agent_settled auto snapshot + replace detection
+ * Legacy dirty-worktree harness and explicit draft actions.
+ *
+ * Orchestrator outcome proposals are consumed by capture.ts before this
+ * fallback is considered.
  */
 
-import type { TreeBackend, GroveNode } from "../backend/types";
+import type { GroveGraph, SessionNode, TreeBackend } from "../backend/types";
 import { codeState } from "../lib/identity";
 import { loadProjectSettings } from "../lib/settings";
-import { canAutoAmend, nodeAtChange, recordOrAmendAuto } from "./ops";
+import { canAutoAmend, pinNode, recordOrAmendAuto } from "./ops";
 import { OperationCoordinator } from "./coordinator";
 
 const REPLACE_RE =
@@ -15,14 +18,16 @@ export function looksLikeReplacement(prompt: string): boolean {
   return REPLACE_RE.test(prompt.trim());
 }
 
-/**
- * Auto snapshot only when the working tree is dirty (material file changes).
- * Plans / Q&A / clean read-only research do not create nodes.
- */
+export function shouldRunLegacyHarness(cwd: string, hasOutcomeLedger: boolean): boolean {
+  const settings = loadProjectSettings(cwd);
+  const mode = settings.trackingMode ?? "auto";
+  if (mode === "off" || mode === "outcome") return false;
+  if (mode === "legacy") return true;
+  return !hasOutcomeLedger;
+}
+
 export function shouldAutoSnapshot(
   cwd: string,
-  _nodes: GroveNode[],
-  _currentChangeId: string,
 ): { ok: true; reason: string } | { ok: false; reason: string } {
   const settings = loadProjectSettings(cwd);
   if (settings.autoSnapshot === false) return { ok: false, reason: "autoSnapshot disabled" };
@@ -32,75 +37,67 @@ export function shouldAutoSnapshot(
   return { ok: true, reason: "dirty working tree" };
 }
 
-export async function onAgentSettled(
-  be: TreeBackend,
+function nodeAtBackendCursor(graph: GroveGraph, changeId: string): SessionNode | undefined {
+  return graph.nodes.find((node) => node.backendRef.changeId === changeId);
+}
+
+export async function onLegacyAgentSettled(
+  backend: TreeBackend,
   cwd: string,
   opts: { sessionFile: string | null; entryId: string | null },
-): Promise<GroveNode | null> {
+): Promise<SessionNode | null> {
   if (!opts.sessionFile) return null;
-  const nodes = await be.listNodes();
-  const current = await be.currentChangeId();
-  const gate = shouldAutoSnapshot(cwd, nodes, current);
+  const gate = shouldAutoSnapshot(cwd);
   if (!gate.ok) return null;
-
-  const coord = new OperationCoordinator(be);
-  const replaceTarget = coord.getReplaceTarget();
-  let amendId: string | null = null;
-  let supersedes: string | null = null;
+  const graph = await backend.getGraph();
+  const coordinator = new OperationCoordinator(backend);
+  const replaceTarget = coordinator.getReplaceTarget();
+  let amendNodeId: string | null = null;
+  let supersedesNodeId: string | null = null;
 
   if (replaceTarget) {
-    const can = canAutoAmend(nodes, replaceTarget);
-    if (can.ok) amendId = replaceTarget;
-    else supersedes = replaceTarget;
-    coord.setReplaceTarget(null);
+    const amendable = canAutoAmend(graph, replaceTarget);
+    if (amendable.ok) amendNodeId = replaceTarget;
+    else supersedesNodeId = replaceTarget;
+    coordinator.setReplaceTarget(null);
   } else {
-    const tip = nodeAtChange(nodes, current);
-    if (tip?.manifest?.kind === "auto" && canAutoAmend(nodes, tip.changeId).ok) {
-      amendId = tip.changeId;
-    }
+    const tip = nodeAtBackendCursor(graph, await backend.currentChangeId());
+    if (tip && canAutoAmend(graph, tip.nodeId).ok) amendNodeId = tip.nodeId;
   }
 
-  return recordOrAmendAuto(be, cwd, {
+  return recordOrAmendAuto(backend, cwd, {
     sessionFile: opts.sessionFile,
     entryId: opts.entryId,
-    replaceChangeId: amendId,
-    supersedes,
+    replaceNodeId: amendNodeId,
+    supersedesNodeId,
   });
 }
 
 export async function autoAction(
-  be: TreeBackend,
-  _cwd: string,
+  backend: TreeBackend,
   action: "keep" | "replace" | "split",
-  changeId: string,
+  nodeId: string,
 ): Promise<string> {
-  const nodes = await be.listNodes();
-  const node = nodeAtChange(nodes, changeId);
-  if (!node?.manifest) throw new Error(`Node not found: ${changeId}`);
-  const coord = new OperationCoordinator(be);
+  const graph = await backend.getGraph();
+  const node = graph.nodes.find((candidate) => candidate.nodeId === nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  const coordinator = new OperationCoordinator(backend);
 
   switch (action) {
     case "keep": {
-      if (node.manifest.lifecycle === "draft") {
-        await be.amendNode({
-          changeId,
-          manifest: { ...node.manifest, lifecycle: "pinned" },
-        });
-      }
-      coord.setReplaceTarget(null);
-      return `kept / pinned ${node.manifest.label}`;
+      if (!node.pinned) await pinNode(backend, node.nodeId);
+      coordinator.setReplaceTarget(null);
+      return `kept / pinned ${node.label}`;
     }
     case "replace": {
-      const can = canAutoAmend(nodes, changeId);
-      coord.setReplaceTarget(changeId);
-      if (!can.ok) return `replace armed (will supersede — ${can.reason})`;
-      return `replace armed for ${changeId.slice(0, 8)}`;
+      const amendable = canAutoAmend(graph, nodeId);
+      coordinator.setReplaceTarget(nodeId);
+      return amendable.ok
+        ? `replace armed for ${nodeId.slice(0, 12)}`
+        : `replace armed (will supersede — ${amendable.reason})`;
     }
-    case "split": {
-      coord.setReplaceTarget(null);
-      return `split: next auto will create a new node (supersedes ${changeId.slice(0, 8)})`;
-    }
-    default:
-      throw new Error(`Unknown auto action: ${action}`);
+    case "split":
+      coordinator.setReplaceTarget(null);
+      return `split: next legacy capture will create a sibling of ${nodeId.slice(0, 12)}`;
   }
 }

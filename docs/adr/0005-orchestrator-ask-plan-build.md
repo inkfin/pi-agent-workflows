@@ -28,6 +28,12 @@ Pi core does not ship plan mode or subagent scheduling. Users want a Cursor-like
 7. Project-local agent profiles require interactive trust approval. Worker
    subprocesses disable implicit project extensions, skills, prompts, and
    context files.
+8. Every user-approved Build has stable `workItemId` and `buildAttemptId`.
+   Orchestrator appends started/finished RunEvents for success, failure, and
+   cancellation. A successful final integrated Build appends a durable
+   AttachmentProposal for Grove; EventBus is notification-only.
+9. Workers receive explicit base code revision and never load or write Grove.
+   Foreground Orchestrator/Grove is the single Tree Repo writer.
 
 ## Consequences
 
@@ -35,5 +41,7 @@ Pi core does not ship plan mode or subagent scheduling. Users want a Cursor-like
 - Users must keep the main tree clean before Build with edits.
 - Conflict or path-boundary failures leave diagnostics and leftover worktrees inspectable via `/orchestrator inspect|cleanup`.
 - Extension depends on `git` and a `pi` binary on PATH for workers.
+- RunLedger preserves diagnostic execution facts even when Grove does not
+  materialize a SessionNode.
 - Operational commands, settings, execution phases, and recovery behavior are
   documented in [Orchestrator](../orchestrator.md).

@@ -1,28 +1,51 @@
 /**
- * grove/backend/jj-cli.ts — TreeBackend via jj CLI (ADR-0001 + ADR-0004)
+ * jj-backed GraphTransaction store.
  *
- * Verified against jj 0.43. All ops serialized through an in-process queue.
+ * jj provides durable, syncable transaction history. Grove materializes its
+ * own SessionNode/Edge graph and never treats jj parents as semantic edges.
  */
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-  encodeManifest,
-  decodeManifest,
+  decodeTransaction,
+  encodeTransaction,
+  isEffectivelySealed,
+  newDomainId,
+  type AmendDraftOptions,
+  type AttachmentRecord,
+  type EdgeRecord,
+  type GraphApplyOptions,
+  type GraphApplyResult,
+  type GraphRecord,
+  type GraphTransaction,
+  type GroveGraph,
+  type GroveRevision,
+  type MaterializedAttachment,
+  type MaterializedEdge,
+  type SessionNode,
+  type SessionNodeRecord,
   type TreeBackend,
-  type GroveNode,
-  type CommitNodeOpts,
-  type AmendNodeOpts,
 } from "./types";
 
 const SEP = "\x1f";
 const MIN_JJ_VERSION = "0.20.0";
+const LOCK_STALE_MS = 2 * 60 * 1000;
+const OBJECT_PATH_RE = /^objects\/[a-f0-9]{64}\.(?:jsonl|json)$/;
 
 export class JjUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "JjUnavailableError";
+  }
+}
+
+export class GroveWriteConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GroveWriteConflictError";
   }
 }
 
@@ -35,14 +58,28 @@ function compareVersion(a: string, b: string): number {
   return 0;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function newer<T extends { revision: number }>(
+  current: { value: T; ref: GroveRevision } | undefined,
+  value: T,
+  ref: GroveRevision,
+): boolean {
+  if (!current) return true;
+  if (value.revision !== current.value.revision) return value.revision > current.value.revision;
+  const byTime = ref.timestamp.localeCompare(current.ref.timestamp);
+  return byTime > 0 || (byTime === 0 && ref.changeId.localeCompare(current.ref.changeId) > 0);
+}
+
 export class JjCliBackend implements TreeBackend {
-  private cwd: string;
-  private relDir: string;
+  private readonly cwd: string;
+  private readonly relDir = path.join(".pi", "tree");
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string) {
     this.cwd = cwd;
-    this.relDir = path.join(".pi", "tree");
   }
 
   repoDir(): string {
@@ -50,9 +87,9 @@ export class JjCliBackend implements TreeBackend {
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const p = this.queue.then(fn);
-    this.queue = p.catch(() => {});
-    return p;
+    const pending = this.queue.then(fn);
+    this.queue = pending.catch(() => {});
+    return pending;
   }
 
   private run(args: string[], opts?: { cwd?: string }): Promise<string> {
@@ -64,9 +101,9 @@ export class JjCliBackend implements TreeBackend {
           cwd: opts?.cwd ?? this.repoDir(),
           maxBuffer: 64 * 1024 * 1024,
         },
-        (err, stdout, stderr) => {
-          if (err) {
-            reject(new Error(`jj ${args.join(" ")} failed: ${stderr.trim() || err.message}`));
+        (error, stdout, stderr) => {
+          if (error) {
+            reject(new Error(`jj ${args.join(" ")} failed: ${stderr.trim() || error.message}`));
           } else {
             resolve(stdout);
           }
@@ -77,8 +114,8 @@ export class JjCliBackend implements TreeBackend {
 
   static async checkAvailability(): Promise<string> {
     return new Promise((resolve, reject) => {
-      execFile("jj", ["--version"], (err, stdout) => {
-        if (err) {
+      execFile("jj", ["--version"], (error, stdout) => {
+        if (error) {
           reject(new JjUnavailableError("jj not found. Install jujutsu (brew install jj) to use grove."));
           return;
         }
@@ -94,114 +131,408 @@ export class JjCliBackend implements TreeBackend {
 
   async ensureRepo(): Promise<string> {
     const dir = this.repoDir();
-    if (fs.existsSync(path.join(dir, ".jj"))) return dir;
-    fs.mkdirSync(path.dirname(dir), { recursive: true });
-    await this.run(["git", "init", "--no-colocate", this.relDir], { cwd: this.cwd });
-    await this.run(["config", "set", "--repo", "user.name", "grove"]);
-    await this.run(["config", "set", "--repo", "user.email", "grove@local"]);
-    await this.run([
-      "describe",
-      "-m",
-      JSON.stringify({
+    const readyPath = path.join(dir, ".grove-ready");
+    if (fs.existsSync(path.join(dir, ".jj")) && fs.existsSync(readyPath)) return dir;
+    const parent = path.dirname(dir);
+    const lockPath = path.join(parent, "tree.init.lock");
+    fs.mkdirSync(parent, { recursive: true });
+    let acquired = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        fs.mkdirSync(lockPath);
+        acquired = true;
+        break;
+      } catch (error: any) {
+        if (error?.code !== "EEXIST") throw error;
+        try {
+          if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+            fs.rmSync(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        await sleep(50);
+      }
+    }
+    if (!acquired) throw new GroveWriteConflictError("grove: timed out initializing Tree Repo");
+    try {
+      if (fs.existsSync(path.join(dir, ".jj")) && fs.existsSync(readyPath)) return dir;
+      if (!fs.existsSync(path.join(dir, ".jj"))) {
+        await this.run(["git", "init", "--no-colocate", this.relDir], { cwd: this.cwd });
+      }
+      await this.run(["config", "set", "--repo", "user.name", "grove"]);
+      await this.run(["config", "set", "--repo", "user.email", "grove@local"]);
+      const createdAt = new Date().toISOString();
+      const transaction: GraphTransaction = {
         v: 1,
-        kind: "root",
-        label: "root",
-        projectId: "",
-        sessionId: "",
-        snapshotId: null,
-        anchor: { entryId: null },
-        lifecycle: "pinned",
-        project: { name: "" },
-        origin: "",
-        createdAt: new Date().toISOString(),
-      }),
-    ]);
-    fs.writeFileSync(
-      path.join(dir, ".gitignore"),
-      ["state.json", ".DS_Store", "journal/", "alignment.json", "outbox/"].join("\n") + "\n",
-    );
-    await this.run(["st"]);
-    return dir;
+        recordType: "transaction",
+        txId: newDomainId("tx"),
+        records: [],
+        createdAt,
+      };
+      await this.run(["describe", "-m", encodeTransaction(transaction)]);
+      fs.writeFileSync(
+        path.join(dir, ".gitignore"),
+        ["state.json", ".DS_Store", ".grove-ready", "journal/", "alignment.json", "outbox/"].join("\n") + "\n",
+      );
+      await this.run(["st"]);
+      fs.writeFileSync(readyPath, "v1\n");
+      return dir;
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
   }
 
-  private nodeFromLog(revset: string): Promise<GroveNode[]> {
+  private async revisionsFromLog(revset: string): Promise<GroveRevision[]> {
     const template =
       `change_id ++ "${SEP}" ++ commit_id ++ "${SEP}" ++ description.first_line() ++ "${SEP}" ++` +
       `parents.map(|c| c.change_id()).join(",") ++ "${SEP}" ++` +
       `committer.timestamp().utc().format("%Y-%m-%dT%H:%M:%SZ") ++ "\n"`;
-    return this.run(["log", "--no-graph", "-r", revset, "-T", template]).then((out) => {
-      const nodes: GroveNode[] = [];
-      for (const line of out.split("\n")) {
-        if (!line) continue;
-        const [changeId, commitId, description, parentsRaw, timestamp] = line.split(SEP);
-        if (!changeId || !commitId) continue;
-        if (/^0+$/.test(commitId)) continue;
-        nodes.push({
-          changeId,
-          commitId,
-          parents: parentsRaw ? parentsRaw.split(",").filter(Boolean) : [],
-          timestamp: timestamp || "",
-          manifest: decodeManifest(description ?? ""),
-        });
-      }
-      return nodes;
-    });
+    const output = await this.run(["log", "--no-graph", "-r", revset, "-T", template]);
+    const revisions: GroveRevision[] = [];
+    for (const line of output.split("\n")) {
+      if (!line) continue;
+      const [changeId, commitId, description, parentsRaw, timestamp] = line.split(SEP);
+      if (!changeId || !commitId || /^0+$/.test(commitId)) continue;
+      revisions.push({
+        changeId,
+        commitId,
+        parents: parentsRaw ? parentsRaw.split(",").filter(Boolean) : [],
+        timestamp: timestamp || "",
+        transaction: decodeTransaction(description ?? ""),
+      });
+    }
+    return revisions;
+  }
+
+  private async transactionHeads(): Promise<string[]> {
+    const revisions = (await this.revisionsFromLog("all()"))
+      .filter((revision) => revision.transaction);
+    const hasChildren = new Set(revisions.flatMap((revision) => revision.parents));
+    return revisions
+      .filter((revision) => !hasChildren.has(revision.changeId))
+      .map((revision) => revision.changeId);
   }
 
   async currentChangeId(): Promise<string> {
-    const out = await this.run(["log", "--no-graph", "-r", "@", "-T", 'change_id ++ "\n"']);
-    return out.trim();
+    const output = await this.run(["log", "--no-graph", "-r", "@", "-T", 'change_id ++ "\n"']);
+    return output.trim();
   }
 
   async currentOperationId(): Promise<string> {
-    const out = await this.run(["op", "log", "--limit", "1", "-T", 'self.id() ++ "\n"']);
-    return out.trim().split("\n")[0] ?? "";
+    const output = await this.run(["op", "log", "--limit", "1", "-T", 'self.id() ++ "\n"']);
+    return output.match(/[0-9a-f]{16,}/)?.[0] ?? output.trim().split(/\s+/).at(-1) ?? "";
+  }
+
+  async graphRevision(): Promise<string> {
+    await this.ensureRepo();
+    const commitIds = (await this.revisionsFromLog("all()"))
+      .filter((revision) => revision.transaction)
+      .map((revision) => revision.commitId)
+      .sort();
+    return createHash("sha256").update(commitIds.join("\n")).digest("hex");
   }
 
   private writeFiles(files: Record<string, string> | undefined): void {
     if (!files) return;
-    for (const [rel, content] of Object.entries(files)) {
-      const fp = path.join(this.repoDir(), rel);
-      fs.mkdirSync(path.dirname(fp), { recursive: true });
-      fs.writeFileSync(fp, content);
+    for (const [relative, content] of Object.entries(files)) {
+      if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes("..")) {
+        throw new Error(`grove: unsafe repo path ${relative}`);
+      }
+      const target = path.join(this.repoDir(), relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content);
     }
   }
 
-  async commitNode(opts: CommitNodeOpts): Promise<GroveNode> {
+  private deleteFiles(files: string[] | undefined): void {
+    for (const relative of files ?? []) {
+      if (!OBJECT_PATH_RE.test(relative)) {
+        throw new Error(`grove: refusing to delete non-object path ${relative}`);
+      }
+      fs.rmSync(path.join(this.repoDir(), relative), { force: true });
+    }
+  }
+
+  private async acquireWriteLock(): Promise<() => void> {
+    const lockPath = path.join(this.repoDir(), "journal", "write.lock");
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        fs.mkdirSync(lockPath);
+        fs.writeFileSync(
+          path.join(lockPath, "owner.json"),
+          JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+        );
+        return () => fs.rmSync(lockPath, { recursive: true, force: true });
+      } catch (error: any) {
+        if (error?.code !== "EEXIST") throw error;
+        try {
+          const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+          if (age > LOCK_STALE_MS) {
+            fs.rmSync(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        await sleep(50);
+      }
+    }
+    throw new GroveWriteConflictError("grove: timed out waiting for the Tree Repo writer");
+  }
+
+  async applyGraphTransaction(opts: GraphApplyOptions): Promise<GraphApplyResult> {
     return this.enqueue(async () => {
       await this.ensureRepo();
-      const parents = opts.parents?.length ? opts.parents : [await this.currentChangeId()];
-      await this.run(["new", ...parents]);
-      this.writeFiles(opts.files);
-      await this.run(["describe", "-m", encodeManifest(opts.manifest)]);
-      const nodes = await this.nodeFromLog("@");
-      const node = nodes[0];
-      if (!node) throw new Error("grove: failed to read back committed node");
-      return node;
+      const release = await this.acquireWriteLock();
+      const preOpId = await this.currentOperationId();
+      let mutated = false;
+      try {
+        const before = await this.graphRevision();
+        if (opts.expectedGraphRevision && opts.expectedGraphRevision !== before) {
+          throw new GroveWriteConflictError(
+            `grove graph changed: expected ${opts.expectedGraphRevision}, got ${before}`,
+          );
+        }
+        const transaction: GraphTransaction = {
+          v: 1,
+          recordType: "transaction",
+          txId: newDomainId("tx"),
+          expectedGraphRevision: opts.expectedGraphRevision,
+          records: opts.records,
+          createdAt: new Date().toISOString(),
+        };
+        const parents = await this.transactionHeads();
+        await this.run(["new", ...(parents.length ? parents : [await this.currentChangeId()])]);
+        mutated = true;
+        this.deleteFiles(opts.deleteFiles);
+        this.writeFiles(opts.files);
+        await this.run(["describe", "-m", encodeTransaction(transaction)]);
+        const revision = (await this.revisionsFromLog("@"))[0];
+        if (!revision) throw new Error("grove: failed to read back GraphTransaction");
+        return {
+          transaction,
+          revision,
+          graphRevision: await this.graphRevision(),
+        };
+      } catch (error) {
+        if (mutated) {
+          try {
+            await this.run(["op", "restore", preOpId]);
+          } catch {
+            /* coordinator journal retains the outer recovery intent */
+          }
+        }
+        throw error;
+      } finally {
+        release();
+      }
     });
   }
 
-  async amendNode(opts: AmendNodeOpts): Promise<GroveNode> {
-    return this.enqueue(async () => {
-      await this.ensureRepo();
-      await this.run(["edit", opts.changeId]);
-      this.writeFiles(opts.files);
-      await this.run(["describe", "-m", encodeManifest(opts.manifest)]);
-      const nodes = await this.nodeFromLog("@");
-      const node = nodes[0];
-      if (!node) throw new Error("grove: failed to read back amended node");
-      return node;
-    });
-  }
-
-  async listNodes(): Promise<GroveNode[]> {
+  async listRevisions(): Promise<GroveRevision[]> {
     await this.ensureRepo();
-    return this.nodeFromLog("all()");
+    return this.revisionsFromLog("all()");
   }
 
-  async showFile(rev: string, relPath: string): Promise<string | null> {
+  async getGraph(): Promise<GroveGraph> {
+    const revisions = await this.listRevisions();
+    const nodes = new Map<string, { value: SessionNodeRecord; ref: GroveRevision }>();
+    const edges = new Map<string, { value: EdgeRecord; ref: GroveRevision }>();
+    const attachments = new Map<string, { value: AttachmentRecord; ref: GroveRevision }>();
+    const dispositions = [];
+    const frontiers = [];
+
+    for (const revision of revisions) {
+      for (const record of revision.transaction?.records ?? []) {
+        if (record.recordType === "node") {
+          const current = nodes.get(record.nodeId);
+          if (newer(current, record, revision)) nodes.set(record.nodeId, { value: record, ref: revision });
+        } else if (record.recordType === "edge") {
+          const current = edges.get(record.edgeId);
+          if (newer(current, record, revision)) edges.set(record.edgeId, { value: record, ref: revision });
+        } else if (record.recordType === "attachment") {
+          const current = attachments.get(record.attachmentId);
+          if (!current || revision.changeId.localeCompare(current.ref.changeId) < 0) {
+            attachments.set(record.attachmentId, { value: record, ref: revision });
+          }
+        } else if (record.recordType === "disposition") {
+          dispositions.push(record);
+        } else {
+          frontiers.push(record);
+        }
+      }
+    }
+
+    const tombstoned = new Set(
+      dispositions
+        .filter((record) => record.targetType === "attachment" && record.action === "tombstoned")
+        .map((record) => record.targetId),
+    );
+    return {
+      revision: await this.graphRevision(),
+      nodes: [...nodes.values()].map(({ value, ref }) => ({
+        ...value,
+        backendRef: {
+          changeId: ref.changeId,
+          commitId: ref.commitId,
+          timestamp: ref.timestamp,
+        },
+      })),
+      edges: [...edges.values()].map(({ value, ref }) => ({
+        ...value,
+        backendRef: {
+          changeId: ref.changeId,
+          commitId: ref.commitId,
+          timestamp: ref.timestamp,
+        },
+      })),
+      attachments: [...attachments.values()]
+        .filter(({ value }) => !tombstoned.has(value.attachmentId))
+        .map(({ value, ref }) => ({
+          ...value,
+          backendRef: {
+            changeId: ref.changeId,
+            commitId: ref.commitId,
+            timestamp: ref.timestamp,
+          },
+        })),
+      dispositions,
+      frontiers,
+    };
+  }
+
+  async getNode(nodeId: string): Promise<SessionNode | null> {
+    return (await this.getGraph()).nodes.find((node) => node.nodeId === nodeId) ?? null;
+  }
+
+  async recordNode(opts: {
+    node: SessionNodeRecord;
+    edges?: EdgeRecord[];
+    attachments?: AttachmentRecord[];
+    files?: Record<string, string>;
+    expectedGraphRevision?: string;
+  }): Promise<SessionNode> {
+    const graph = await this.getGraph();
+    if (graph.nodes.some((node) => node.nodeId === opts.node.nodeId)) {
+      throw new Error(`grove: node already exists: ${opts.node.nodeId}`);
+    }
+    await this.applyGraphTransaction({
+      records: [opts.node, ...(opts.edges ?? []), ...(opts.attachments ?? [])],
+      files: opts.files,
+      expectedGraphRevision: opts.expectedGraphRevision ?? graph.revision,
+    });
+    const node = await this.getNode(opts.node.nodeId);
+    if (!node) throw new Error(`grove: failed to materialize node ${opts.node.nodeId}`);
+    return node;
+  }
+
+  async amendDraft(opts: AmendDraftOptions): Promise<SessionNode> {
+    const graph = await this.getGraph();
+    const current = graph.nodes.find((node) => node.nodeId === opts.nodeId);
+    if (!current) throw new Error(`grove: node not found: ${opts.nodeId}`);
+    if (current.revision !== opts.expectedRevision) {
+      throw new GroveWriteConflictError(
+        `grove node revision changed: expected ${opts.expectedRevision}, got ${current.revision}`,
+      );
+    }
+    if (isEffectivelySealed(current, graph.edges)) {
+      throw new GroveWriteConflictError(`grove: node ${opts.nodeId} is sealed`);
+    }
+    const { backendRef: _backendRef, ...record } = current;
+    const next: SessionNodeRecord = {
+      ...record,
+      ...opts.patch,
+      nodeId: current.nodeId,
+      revision: current.revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.applyGraphTransaction({
+      records: [next, ...(opts.attachments ?? [])],
+      files: opts.files,
+      deleteFiles: opts.deleteFiles,
+      expectedGraphRevision: opts.expectedGraphRevision ?? graph.revision,
+    });
+    return (await this.getNode(opts.nodeId))!;
+  }
+
+  async appendEdge(opts: {
+    edge: EdgeRecord;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedEdge> {
+    const graph = await this.getGraph();
+    if (!graph.nodes.some((node) => node.nodeId === opts.edge.fromNodeId)) {
+      throw new Error(`grove: edge source missing: ${opts.edge.fromNodeId}`);
+    }
+    if (!graph.nodes.some((node) => node.nodeId === opts.edge.toNodeId)) {
+      throw new Error(`grove: edge target missing: ${opts.edge.toNodeId}`);
+    }
+    await this.applyGraphTransaction({
+      records: [opts.edge],
+      expectedGraphRevision: opts.expectedGraphRevision ?? graph.revision,
+    });
+    return (await this.getGraph()).edges.find((edge) => edge.edgeId === opts.edge.edgeId)!;
+  }
+
+  async deleteEdge(opts: {
+    edgeId: string;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedEdge> {
+    const graph = await this.getGraph();
+    const edge = graph.edges.find((candidate) => candidate.edgeId === opts.edgeId);
+    if (!edge) throw new Error(`grove: edge not found: ${opts.edgeId}`);
+    const { backendRef: _backendRef, ...record } = edge;
+    const deleted: EdgeRecord = {
+      ...record,
+      revision: edge.revision + 1,
+      state: "deleted",
+      createdAt: new Date().toISOString(),
+    };
+    await this.applyGraphTransaction({
+      records: [deleted],
+      expectedGraphRevision: opts.expectedGraphRevision ?? graph.revision,
+    });
+    return (await this.getGraph()).edges.find((candidate) => candidate.edgeId === opts.edgeId)!;
+  }
+
+  async appendAttachment(opts: {
+    attachment: AttachmentRecord;
+    files?: Record<string, string>;
+    expectedGraphRevision?: string;
+  }): Promise<MaterializedAttachment> {
+    const graph = await this.getGraph();
+    const existing = graph.attachments.find(
+      (attachment) => attachment.attachmentId === opts.attachment.attachmentId,
+    );
+    if (existing) return existing;
+    if (
+      graph.dispositions.some(
+        (record) =>
+          record.targetType === "attachment" &&
+          record.targetId === opts.attachment.attachmentId &&
+          record.action === "tombstoned",
+      )
+    ) {
+      throw new Error(`grove: attachment was tombstoned: ${opts.attachment.attachmentId}`);
+    }
+    if (!graph.nodes.some((node) => node.nodeId === opts.attachment.targetNodeId)) {
+      throw new Error(`grove: attachment target missing: ${opts.attachment.targetNodeId}`);
+    }
+    await this.applyGraphTransaction({
+      records: [opts.attachment],
+      files: opts.files,
+      expectedGraphRevision: opts.expectedGraphRevision ?? graph.revision,
+    });
+    return (await this.getGraph()).attachments.find(
+      (attachment) => attachment.attachmentId === opts.attachment.attachmentId,
+    )!;
+  }
+
+  async showFile(rev: string, relative: string): Promise<string | null> {
     try {
-      return await this.run(["file", "show", "-r", rev, relPath]);
+      return await this.run(["file", "show", "-r", rev, relative]);
     } catch {
       return null;
     }
@@ -211,6 +542,12 @@ export class JjCliBackend implements TreeBackend {
     return this.enqueue(async () => {
       await this.run(["edit", changeId]);
     });
+  }
+
+  async gotoNode(nodeId: string): Promise<void> {
+    const node = await this.getNode(nodeId);
+    if (!node) throw new Error(`grove: node not found: ${nodeId}`);
+    await this.edit(node.backendRef.changeId);
   }
 
   async undo(): Promise<void> {
@@ -227,7 +564,6 @@ export class JjCliBackend implements TreeBackend {
 
   async setBookmark(name: string, changeId: string): Promise<void> {
     return this.enqueue(async () => {
-      // create-or-set: try set, fall back to create
       try {
         await this.run(["bookmark", "set", name, "-r", changeId]);
       } catch {
@@ -238,19 +574,20 @@ export class JjCliBackend implements TreeBackend {
 
   async listBookmarks(): Promise<Array<{ name: string; changeId: string }>> {
     await this.ensureRepo();
-    const out = await this.run([
+    const output = await this.run([
       "bookmark",
       "list",
       "-T",
       `name ++ "${SEP}" ++ normal_target.change_id() ++ "\\n"`,
     ]);
-    const result: Array<{ name: string; changeId: string }> = [];
-    for (const line of out.split("\n")) {
-      if (!line) continue;
-      const [name, changeId] = line.split(SEP);
-      if (name && changeId) result.push({ name, changeId });
-    }
-    return result;
+    return output
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [name, changeId] = line.split(SEP);
+        return { name, changeId };
+      })
+      .filter((bookmark) => Boolean(bookmark.name && bookmark.changeId));
   }
 
   async ensureRemote(name: string, url: string): Promise<void> {

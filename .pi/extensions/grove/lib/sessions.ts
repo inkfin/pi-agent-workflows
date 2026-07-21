@@ -94,12 +94,29 @@ export type AnchorResolve =
   | { ok: true; method: "entryId" | "ordinal" | "prefixHash"; entryId: string | null }
   | { ok: false; reason: string };
 
+function entryIdFromLine(line: string): string | null {
+  try {
+    const entry = JSON.parse(line);
+    const id = entry?.id ?? entry?.entryId ?? entry?.message?.id;
+    return id == null || entry?.type === "session" ? null : String(id);
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve an anchor against a live session file (compaction-aware). */
 export function resolveAnchor(sessionFile: string, anchor: SessionAnchor): AnchorResolve {
   if (!fs.existsSync(sessionFile)) {
     return { ok: false, reason: "session file missing" };
   }
-  const lines = fs.readFileSync(sessionFile, "utf-8").split("\n").filter(Boolean);
+  return resolveAnchorContent(fs.readFileSync(sessionFile, "utf-8"), anchor);
+}
+
+export function resolveAnchorContent(
+  content: string,
+  anchor: SessionAnchor,
+): AnchorResolve {
+  const lines = content.split("\n").filter(Boolean);
 
   if (anchor.entryId) {
     for (const line of lines) {
@@ -107,7 +124,10 @@ export function resolveAnchor(sessionFile: string, anchor: SessionAnchor): Ancho
         const entry = JSON.parse(line);
         const id = entry?.id ?? entry?.entryId ?? entry?.message?.id;
         if (id === anchor.entryId) {
-          return { ok: true, method: "entryId", entryId: anchor.entryId };
+          if (!anchor.entryHash || hashLine(line) === anchor.entryHash) {
+            return { ok: true, method: "entryId", entryId: String(id) };
+          }
+          break;
         }
       } catch {
         /* skip */
@@ -117,7 +137,11 @@ export function resolveAnchor(sessionFile: string, anchor: SessionAnchor): Ancho
 
   if (anchor.ordinal != null && anchor.ordinal >= 0 && anchor.ordinal < lines.length && anchor.entryHash) {
     if (hashLine(lines[anchor.ordinal]) === anchor.entryHash) {
-      return { ok: true, method: "ordinal", entryId: anchor.entryId };
+      return {
+        ok: true,
+        method: "ordinal",
+        entryId: entryIdFromLine(lines[anchor.ordinal]),
+      };
     }
   }
 
@@ -125,7 +149,11 @@ export function resolveAnchor(sessionFile: string, anchor: SessionAnchor): Ancho
     for (let i = 0; i < lines.length; i++) {
       const prefix = lines.slice(0, i + 1).join("\n");
       if (sha256(prefix).slice(0, 16) === anchor.prefixHash) {
-        return { ok: true, method: "prefixHash", entryId: anchor.entryId };
+        return {
+          ok: true,
+          method: "prefixHash",
+          entryId: entryIdFromLine(lines[i]),
+        };
       }
     }
   }
