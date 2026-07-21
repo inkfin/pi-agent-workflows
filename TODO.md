@@ -123,6 +123,7 @@
 
 ### 2.5 加固（下一阶段入口）
 - [ ] **dogfood 迭代**：在本项目日常使用，收集手感问题
+  - 2026-07-21 第一轮：修正 pi session 目录 slug、跨 session goto entry 对齐、状态栏跟随 jj `@`、同 session 历史节点 merge/pick，以及交互 fork 使用过期 entryId；`npm test` 18 项通过
 - [ ] **compaction 对齐**：pi compact 后 entryId 有效性与快照 offset（Entire 踩过的坑，docs/ref/entire.md）
 - [ ] redaction 规则加强（当前仅 sk-/AKIA/ghp_/JWT 四类 naive 模式）
 - [ ] settings 分层：registry 退出等项目级配置应入仓共享，个人偏好走本地（参考 Entire settings.local 分层）

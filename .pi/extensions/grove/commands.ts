@@ -26,6 +26,7 @@ import {
   ensureSessionAvailable,
   nodeSummaryForInject,
   nodeForSession,
+  nodeAtChange,
 } from "./mapping/ops";
 import { machineId, codeState } from "./lib/identity";
 import { countSessionMessages } from "./lib/sessions";
@@ -38,6 +39,28 @@ function findNode(nodes: GroveNode[], target: string): GroveNode | undefined {
     nodes.find((n) => n.manifest?.label === target) ??
     nodes.find((n) => n.manifest?.label.toLowerCase().includes(lower))
   );
+}
+
+export function groveStatusLabel(node: GroveNode | undefined): string {
+  const m = node?.manifest;
+  if (!m) return "◇ untracked";
+  const glyph =
+    m.kind === "root" ? "◇" :
+    m.kind === "fork" ? "⑂" :
+    m.kind === "merge" ? "⊙" :
+    "◆";
+  return `${glyph} ${m.label}`;
+}
+
+async function refreshGroveStatus(
+  ctx: Pick<ExtensionCommandContext, "ui">,
+  be: TreeBackend,
+): Promise<void> {
+  const [nodes, currentChange] = await Promise.all([
+    be.listNodes(),
+    be.currentChangeId(),
+  ]);
+  ctx.ui.setStatus("grove", groveStatusLabel(nodeAtChange(nodes, currentChange)));
 }
 
 export function setupGrove(pi: ExtensionAPI) {
@@ -86,9 +109,7 @@ export function setupGrove(pi: ExtensionAPI) {
 
     if (ctx.hasUI) {
       try {
-        const nodes = await be.listNodes();
-        const node = nodeForSession(nodes, sessionFile);
-        ctx.ui.setStatus("grove", node ? `◆ ${node.manifest?.label ?? "node"}` : "◇ untracked");
+        await refreshGroveStatus(ctx, be);
       } catch {
         /* repo not initialized yet */
       }
@@ -182,8 +203,8 @@ async function handle(
     case "st": {
       const nodes = await be.listNodes();
       const sessionFile = ctx.sessionManager.getSessionFile();
-      const node = nodeForSession(nodes, sessionFile);
       const currentChange = await be.currentChangeId();
+      const node = nodeAtChange(nodes, currentChange);
       const lines: string[] = [];
       lines.push(`machine: ${machineId()}`);
       lines.push(`tree repo: ${be.repoDir()}`);
@@ -228,6 +249,7 @@ async function handle(
     case "undo":
     case "u": {
       await be.undo();
+      await refreshGroveStatus(ctx, be);
       ctx.ui.notify("Undid the last tree operation (jj undo).", "success");
       break;
     }
@@ -324,8 +346,7 @@ async function handle(
             );
             break;
           }
-          const forkEntry =
-            result.node?.manifest?.entryId ?? ctx.sessionManager.getLeafId();
+          const forkEntry = ctx.sessionManager.getLeafId();
           if (!forkEntry) {
             ctx.ui.notify("No active session entry to fork from.", "error");
             break;
@@ -361,6 +382,7 @@ async function handle(
         }
         case "undo": {
           await be.undo();
+          await refreshGroveStatus(ctx, be);
           ctx.ui.notify("Undid the last tree operation (jj undo).", "success");
           break;
         }
@@ -379,7 +401,7 @@ async function handle(
 }
 
 /** Move to a node: repo @ first, then pi session alignment. */
-async function gotoNode(
+export async function gotoNode(
   ctx: ExtensionCommandContext,
   be: TreeBackend,
   target: GroveNode,
@@ -404,6 +426,7 @@ async function gotoNode(
     if (entryId) {
       await ctx.navigateTree(entryId, { summarize: true });
     }
+    ctx.ui.setStatus("grove", `◆ ${targetLabel}`);
     ctx.ui.notify(`@ → ${targetLabel}`, "success");
     return;
   }
@@ -411,6 +434,9 @@ async function gotoNode(
   await be.edit(targetChangeId);
   await ctx.switchSession(availability.path, {
     withSession: async (replacementCtx) => {
+      if (entryId) {
+        await replacementCtx.navigateTree(entryId, { summarize: true });
+      }
       replacementCtx.ui.setStatus("grove", `◆ ${targetLabel}`);
       replacementCtx.ui.notify(
         `@ → ${targetLabel}${availability.materialized ? " (materialized from snapshot)" : ""}`,

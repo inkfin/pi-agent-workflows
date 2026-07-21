@@ -138,3 +138,8 @@ export function nodeForSession(nodes: GroveNode[], sessionFile: string | null): 
   }
   return best;
 }
+
+/** Find the node currently edited by jj. */
+export function nodeAtChange(nodes: GroveNode[], changeId: string): GroveNode | undefined {
+  return nodes.find((n) => n.changeId === changeId);
+}

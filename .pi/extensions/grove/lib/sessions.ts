@@ -14,9 +14,9 @@ export function getSessionsDir(): string {
   return path.join(agentDir, "sessions");
 }
 
-/** Matches pi's session dir naming: --<path-with-dashes> */
+/** Matches pi's session dir naming: --<path-with-dashes>-- */
 export function cwdToSessionSlug(cwd: string): string {
-  return "--" + cwd.replace(/^\//, "").replace(/\//g, "-").replace(/ /g, "_");
+  return "--" + cwd.replace(/^\//, "").replace(/\//g, "-").replace(/ /g, "_") + "--";
 }
 
 export function projectSessionsDir(cwd: string): string {

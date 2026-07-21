@@ -81,8 +81,13 @@ export class GroveTreeView extends Container implements Component, Focusable {
     this.currentSessionRef = currentSessionRef;
     this.theme = theme;
     this.rebuild();
-    // Pre-select the node tracking the current session, else the @ change.
-    const idx = this.rows.findIndex((r) => r.isCurrent);
+    // Prefer jj @; fall back to the current session only if @ is not visible.
+    let idx = this.rows.findIndex((r) => r.isCurrent);
+    if (idx < 0 && this.currentSessionRef) {
+      idx = this.rows.findIndex(
+        (r) => r.node.manifest?.sessionRef === this.currentSessionRef,
+      );
+    }
     if (idx >= 0) this.selected = idx;
   }
 
@@ -94,8 +99,7 @@ export class GroveTreeView extends Container implements Component, Focusable {
   }
 
   private isCurrentNode(n: GroveNode): boolean {
-    if (n.changeId === this.currentChangeId) return true;
-    return Boolean(this.currentSessionRef && n.manifest?.sessionRef === this.currentSessionRef);
+    return n.changeId === this.currentChangeId;
   }
 
   private rebuild(): void {
