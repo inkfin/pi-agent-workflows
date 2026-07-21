@@ -10,7 +10,7 @@ Personal pi agent workflow toolkit. Three layers:
 
 ```
 .pi/extensions/commands/      — Phase 1: common commands (active)
-.pi/extensions/grove/         — Phase 2: grove local tree (active; sync folds in as Phase 3)
+.pi/extensions/grove/         — Phase 2–3: grove local tree + sync
 .pi/extensions/shared/        — shared utilities
 tests/                        — grove e2e + unit checks (npm test)
 docs/adr/                     — architecture decisions
@@ -30,50 +30,65 @@ A single pi conversation. Storage for turns; not itself a unit of the tree.
 One exchange within a session. Turns are ephemeral; most never become nodes.
 
 **Node**:
-A durable point in a project's session history: a checkpoint, fork, or merge.
+A durable point in a project's session history: a checkpoint, fork, merge, auto, or frontier.
 _Avoid_: branch
 
 **Checkpoint**:
-A Node explicitly named by the user to mark a position.
+A Node explicitly named by the user to mark a position (always pinned).
+
+**SessionAnchor**:
+A durable pointer into a pi session (`entryId`, `entryHash`, `ordinal`, `prefixHash`).
+Used for goto/fork recovery after compaction. Not related to the Cursor product.
 
 **Tree Repo**:
-The per-project store holding Nodes and Session Snapshots. Its remote boundary equals the privacy/collaboration boundary.
+The per-project store holding Nodes and content-addressed Session Snapshots.
+Its remote boundary equals the privacy/collaboration boundary.
 
 **Session Snapshot**:
-The captured conversation content attached to a Node; the payload that cherry-pick transports.
+Immutable conversation content addressed by `snapshotId` (`objects/<sha256>.jsonl`).
 
 **Registry**:
 The shared catalog of projects and sessions across machines. Metadata only; never holds Session Snapshots.
 
 **Origin**:
-The machine where a Node was created. Provenance, not identity.
+The machine where a Node was created. Provenance, not identity. Each origin owns one sync bookmark.
+
+**Lifecycle** (auto Nodes):
+`draft` → `pinned` → `published`. Only draft Nodes without children may be auto-amended.
 
 ## Relationships
 
 - A **Session** contains many **Turns**; only a few become **Nodes**
-- A **Node** belongs to exactly one **Tree Repo** and may hold one **Session Snapshot**
-- A **Node** records its **Origin**
+- A **Node** belongs to exactly one **Tree Repo** and may reference one **Session Snapshot**
+- A **Node** records its **Origin** and a **SessionAnchor**
 - The **Registry** catalogs many **Tree Repos** but contains no **Session Snapshots**
 
 ## Key Decisions
 
-- Node is the durable unit; a Session is storage, not a tree citizen (supersedes "one branch = one session file")
+- Node is the durable unit; a Session is storage, not a tree citizen
 - Tree backend: jj CLI behind a `TreeBackend` interface, git-backed storage — [ADR-0001](docs/adr/0001-tree-backend-jj-cli.md)
 - Sync topology: per-project Tree Repos + central metadata Registry — [ADR-0002](docs/adr/0002-sync-topology-per-project-repos.md)
+- Not using Entire as backend — [ADR-0003](docs/adr/0003-not-using-entire-as-backend.md)
+- Grove schema, SessionAnchor, coordinator, harness auto, sync protocol — [ADR-0004](docs/adr/0004-grove-schema-and-consistency.md)
+- Manifest schema is `v: 1`; until the first release it evolves in place, then becomes a compatibility boundary
 - Sync stays explicit (triggered by user or agent command), never background-automatic
 - Conflicts surface as branches in the tree, not file-level merges
-- Merge / cherry-pick strategy: context-inject — works across machines and projects
+- Merge strategy: context-inject (`context_merge`) — works across machines and projects
 - `/grove` is the unified entry point; pi's built-in `/tree` stays untouched
-- Privacy: remotes must be private; a project may opt out of the Registry
+- Privacy: remotes must be private; sync default-off; a project may opt out of the Registry
 
 ## Example dialogue
 
 > **Dev:** "When I checkpoint on my office Mac, does the Registry get the conversation?"
 > **Expert:** "No. The Checkpoint and its Session Snapshot stay in the project's Tree Repo. The Registry only learns that the session exists, which remote holds it, and its Origin machine."
 
+> **Dev:** "Does 'SessionAnchor' mean Cursor?"
+> **Expert:** "No. It is a Grove term for a position inside a pi session (entryId + content hashes)."
+
 ## Flagged ambiguities
 
-- "branch" used to mean "one pi session file" — resolved: the durable unit is the **Node**; avoid "branch" in grove contexts (jj bookmarks remain an internal mechanism).
+- "branch" means a jj bookmark only at the backend boundary; the durable Grove unit is the **Node**.
+- **SessionAnchor** means a position in a pi session and has no Cursor product dependency.
 
 ## Development
 

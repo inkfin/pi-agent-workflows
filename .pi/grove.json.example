@@ -1,0 +1,7 @@
+{
+  "treeRemote": "git@github.com:YOU/PRIVATE-grove-tree.git",
+  "privateRemoteConfirmed": false,
+  "encryptPayload": false,
+  "registry": true,
+  "autoSnapshot": true
+}

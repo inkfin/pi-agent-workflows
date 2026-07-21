@@ -1,13 +1,8 @@
 /**
  * grove/lib/identity.ts — machine / project / code identity
- *
- * Identity model (CONTEXT.md):
- * - Node    → jj change-id (backend)
- * - Session → pi session file basename (never a path)
- * - Machine → machine-id from XDG config (provenance only)
- * - Project → git remote URL hash... v1: remote URL string or dir basename
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,7 +10,6 @@ import { git, projectName } from "../../shared/utils";
 
 interface GroveConfig {
   machineId: string;
-  /** Manual path → projectId bindings (for cross-machine path differences). */
   projectBindings?: Record<string, string>;
 }
 
@@ -48,26 +42,49 @@ export function saveConfig(cfg: GroveConfig): void {
 
 let cachedMachineId: string | null = null;
 
-/** Stable machine identity (provenance). User-editable in ~/.config/grove/config.json. */
 export function machineId(): string {
   if (!cachedMachineId) cachedMachineId = loadConfig().machineId;
   return cachedMachineId;
 }
 
+/** Sanitize origin for bookmark names. */
+export function originBookmarkName(origin = machineId()): string {
+  const safe = origin.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "local";
+  return `grove/origins/${safe}`;
+}
+
 export interface ProjectInfo {
   name: string;
   vcsRemote?: string;
+  projectId: string;
 }
 
 export function projectInfo(cwd: string): ProjectInfo {
+  const cfg = loadConfig();
+  const bound = cfg.projectBindings?.[cwd];
   const remote = git(["remote", "get-url", "origin"], cwd) ?? undefined;
-  return { name: projectName(cwd), vcsRemote: remote };
+  const name = projectName(cwd);
+  const seed = bound ?? remote ?? name;
+  const projectId = createHash("sha256").update(seed).digest("hex").slice(0, 16);
+  return { name, vcsRemote: remote, projectId };
 }
 
-/** Current code state pointer (read-only; Phase 4 makes this interactive). */
-export function codeState(cwd: string): { vcs: "git"; rev: string; dirty: boolean } | null {
+export interface CodeState {
+  vcs: "git";
+  rev: string;
+  dirty: boolean;
+  fingerprint: string;
+}
+
+/** Current code state pointer + fingerprint for harness change detection. */
+export function codeState(cwd: string): CodeState | null {
   const rev = git(["rev-parse", "HEAD"], cwd);
   if (!rev) return null;
-  const status = git(["status", "--porcelain"], cwd);
-  return { vcs: "git", rev, dirty: Boolean(status && status.length > 0) };
+  const status = git(["status", "--porcelain"], cwd) ?? "";
+  const dirty = status.length > 0;
+  const fingerprint = createHash("sha256")
+    .update(rev + "\n" + status)
+    .digest("hex")
+    .slice(0, 16);
+  return { vcs: "git", rev, dirty, fingerprint };
 }

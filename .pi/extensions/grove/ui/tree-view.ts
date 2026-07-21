@@ -1,16 +1,22 @@
 /**
- * grove/ui/tree-view.ts — jj-log style interactive tree view
+ * grove/ui/tree-view.ts — full-capability interactive grove view
  *
  * Keys:
- *   j/k or ↓/↑  move selection
- *   Enter       expand/collapse node details
- *   s           goto selected node (switch/navigate)
- *   c           commit (checkpoint current session)
- *   f           fork from selected node
- *   m           merge selected node into current (context-inject)
- *   p           cherry-pick selected node into current
- *   u           undo last repo operation
- *   q / Esc     close
+ *   j/k     navigate
+ *   Enter   expand/collapse details
+ *   s       goto
+ *   c       commit (checkpoint)
+ *   f       fork from selected
+ *   m       context merge
+ *   p       cherry-pick
+ *   u       logical undo
+ *   a       auto menu (keep/replace/split) — cycles via result
+ *   r       realign / recover
+ *   y       sync push
+ *   Y       sync pull
+ *   d       dashboard
+ *   n       rename/pin
+ *   q/Esc   close
  */
 
 import {
@@ -21,9 +27,27 @@ import {
 } from "@earendil-works/pi-tui";
 import type { GroveNode } from "../backend/types";
 
+export type GroveAction =
+  | "goto"
+  | "commit"
+  | "fork"
+  | "merge"
+  | "pick"
+  | "undo"
+  | "auto-keep"
+  | "auto-replace"
+  | "auto-split"
+  | "realign"
+  | "sync-push"
+  | "sync-pull"
+  | "dashboard"
+  | "pin"
+  | "close";
+
 export interface GroveViewResult {
-  action: "goto" | "commit" | "fork" | "merge" | "pick" | "undo" | "close";
+  action: GroveAction;
   node?: GroveNode;
+  disabledReason?: string;
 }
 
 interface Row {
@@ -31,7 +55,6 @@ interface Row {
   depth: number;
   isCurrent: boolean;
   isExpanded: boolean;
-  /** connector info: for each ancestor level, whether the edge continues */
   continues: boolean[];
   isLastChild: boolean;
 }
@@ -53,7 +76,9 @@ function kindGlyph(node: GroveNode): string {
   switch (node.manifest?.kind) {
     case "root": return "◇";
     case "fork": return "⑂";
-    case "merge": return "⊙";
+    case "context_merge": return "⊙";
+    case "auto": return "○";
+    case "frontier": return "▣";
     default: return "◆";
   }
 }
@@ -68,6 +93,7 @@ export class GroveTreeView extends Container implements Component, Focusable {
   private theme: Theme;
   private _focused = false;
   private _resolve: ((r: GroveViewResult) => void) | null = null;
+  private statusHint = "";
 
   constructor(
     nodes: GroveNode[],
@@ -81,12 +107,9 @@ export class GroveTreeView extends Container implements Component, Focusable {
     this.currentSessionRef = currentSessionRef;
     this.theme = theme;
     this.rebuild();
-    // Prefer jj @; fall back to the current session only if @ is not visible.
     let idx = this.rows.findIndex((r) => r.isCurrent);
     if (idx < 0 && this.currentSessionRef) {
-      idx = this.rows.findIndex(
-        (r) => r.node.manifest?.sessionRef === this.currentSessionRef,
-      );
+      idx = this.rows.findIndex((r) => r.node.manifest?.sessionId === this.currentSessionRef);
     }
     if (idx >= 0) this.selected = idx;
   }
@@ -108,9 +131,8 @@ export class GroveTreeView extends Container implements Component, Focusable {
     const roots: GroveNode[] = [];
     for (const n of this.nodes) {
       const structural = n.parents.filter((p) => known.has(p));
-      if (structural.length === 0) {
-        roots.push(n);
-      } else {
+      if (structural.length === 0) roots.push(n);
+      else {
         const key = structural[0];
         const arr = byParent.get(key) ?? [];
         arr.push(n);
@@ -121,19 +143,17 @@ export class GroveTreeView extends Container implements Component, Focusable {
     roots.sort(byTimeDesc);
     for (const arr of byParent.values()) arr.sort(byTimeDesc);
 
-    // Branch containing current node first among roots.
-    const currentIdx = roots.findIndex((r) => this.isCurrentNode(r));
-    if (currentIdx > 0) {
-      const [cur] = roots.splice(currentIdx, 1);
-      roots.unshift(cur);
-    }
-
     const rows: Row[] = [];
     const walk = (node: GroveNode, depth: number, continues: boolean[], isLastChild: boolean) => {
-      const isCur = this.isCurrentNode(node);
-      rows.push({ node, depth, isCurrent: isCur, isExpanded: this.expanded.has(node.changeId), continues, isLastChild });
+      rows.push({
+        node,
+        depth,
+        isCurrent: this.isCurrentNode(node),
+        isExpanded: this.expanded.has(node.changeId),
+        continues,
+        isLastChild,
+      });
       const children = byParent.get(node.changeId) ?? [];
-      // Merge children (2nd+ parents) are rendered as edge annotations, not walked twice.
       children.forEach((child, i) => {
         const last = i === children.length - 1;
         walk(child, depth + 1, [...continues, !last], last);
@@ -142,6 +162,16 @@ export class GroveTreeView extends Container implements Component, Focusable {
     roots.forEach((r, i) => walk(r, 0, [], i === roots.length - 1));
     this.rows = rows;
     if (this.selected >= rows.length) this.selected = Math.max(0, rows.length - 1);
+  }
+
+  private emit(action: GroveAction, node?: GroveNode, disabledReason?: string): void {
+    if (!this._resolve) return;
+    if (disabledReason) {
+      this.statusHint = disabledReason;
+      this.invalidate();
+      return;
+    }
+    this._resolve({ action, node });
   }
 
   render(width: number): string[] {
@@ -155,32 +185,37 @@ export class GroveTreeView extends Container implements Component, Focusable {
     out.push("");
 
     if (this.rows.length === 0) {
-      out.push(fg("dim", "  (empty — create your first checkpoint with /grove commit <label>)"));
+      out.push(fg("dim", "  (empty — /grove commit <label>)"));
     }
 
     this.rows.forEach((row, i) => {
       const n = row.node;
       const m = n.manifest;
-
-      // Tree connector prefix
       let prefix = "";
       for (let d = 0; d < row.depth; d++) {
         prefix += row.continues[d] ? "│  " : "   ";
       }
       if (row.depth > 0) prefix += row.isLastChild ? "└─ " : "├─ ";
 
-      // Marker: @ for current, kind glyph otherwise
       const isAt = n.changeId === this.currentChangeId;
       const glyph = isAt ? "@" : kindGlyph(n);
-      const glyphColored = isAt ? fg("accent", bold(glyph)) : m?.kind === "checkpoint" ? fg("success", glyph) : fg("muted", glyph);
+      const glyphColored = isAt
+        ? fg("accent", bold(glyph))
+        : m?.kind === "checkpoint"
+          ? fg("success", glyph)
+          : m?.kind === "auto"
+            ? fg("warning", glyph)
+            : fg("muted", glyph);
 
-      const label = m?.label ?? "(non-grove commit)";
+      const label = m?.label ?? "(non-grove)";
       const labelStyled = row.isCurrent ? bold(label) : label;
       const meta: string[] = [];
       const ago = timeAgo(n.timestamp);
       if (ago) meta.push(ago);
-      if (m && m.origin) meta.push(m.origin);
+      if (m?.lifecycle && m.lifecycle !== "pinned") meta.push(m.lifecycle);
+      if (m?.origin) meta.push(m.origin);
       if (m?.code?.dirty) meta.push("✎");
+      if (m?.supersedes) meta.push("supersedes");
       if (n.parents.length > 1) meta.push(`${n.parents.length} parents`);
 
       let line = `${prefix}${glyphColored} ${fg("accent", labelStyled)}  ${fg("dim", meta.join(" · "))}`;
@@ -190,22 +225,34 @@ export class GroveTreeView extends Container implements Component, Focusable {
       if (row.isExpanded && m) {
         const detailPrefix = prefix.replace(/[├└]─ $/, "   ") + "   ";
         const details = [
-          `change ${n.changeId.slice(0, 12)} · session ${m.sessionRef}${m.entryId ? ` · entry ${m.entryId.slice(0, 8)}` : ""}`,
-          m.code ? `code ${m.code.rev.slice(0, 8)}${m.code.dirty ? " (dirty)" : ""}` : "no code state",
-        ];
+          `change ${n.changeId.slice(0, 12)} · session ${m.sessionId || "—"} · life ${m.lifecycle}`,
+          `anchor entry ${m.anchor.entryId?.slice(0, 8) ?? "head"} · snap ${m.snapshotId?.slice(0, 12) ?? "none"}`,
+          m.code
+            ? `code ${m.code.rev.slice(0, 8)}${m.code.dirty ? " dirty" : ""} fp ${m.code.fingerprint ?? "?"}`
+            : "no code state",
+          m.forkFrom ? `forkFrom ${m.forkFrom.parentChangeId.slice(0, 8)}` : "",
+          m.mergeOf ? `mergeOf ${m.mergeOf.map((s) => s.changeId.slice(0, 8)).join(",")}` : "",
+        ].filter(Boolean);
         for (const d of details) out.push(fg("dim", detailPrefix + d));
       }
     });
 
     out.push("");
     out.push(fg("dim", "─".repeat(Math.min(width, 80))));
-    out.push(fg("muted", "j/k:nav Enter:detail s:goto c:commit f:fork m:merge p:pick u:undo q:close"));
+    if (this.statusHint) out.push(fg("warning", this.statusHint));
+    out.push(
+      fg(
+        "muted",
+        "j/k s:goto c:commit f:fork m:merge p:pick u:undo a/A/S:auto r:realign y/Y:sync d:dash n:pin q",
+      ),
+    );
     return out;
   }
 
   handleInput(data: string): void {
     if (!this._resolve) return;
     const selectedNode = (): GroveNode | undefined => this.rows[this.selected]?.node;
+    this.statusHint = "";
 
     switch (data) {
       case "j":
@@ -231,33 +278,78 @@ export class GroveTreeView extends Container implements Component, Focusable {
       }
       case "s": {
         const n = selectedNode();
-        if (n?.manifest) this._resolve({ action: "goto", node: n });
+        if (!n?.manifest) this.emit("goto", undefined, "no node selected");
+        else this.emit("goto", n);
         break;
       }
       case "c":
-        this._resolve({ action: "commit" });
+        this.emit("commit");
         break;
       case "f": {
         const n = selectedNode();
-        this._resolve({ action: "fork", node: n });
+        if (!n?.manifest) this.emit("fork", undefined, "select a node to fork from");
+        else this.emit("fork", n);
         break;
       }
       case "m": {
         const n = selectedNode();
-        if (n?.manifest && !this.isCurrentNode(n)) this._resolve({ action: "merge", node: n });
+        if (!n?.manifest) this.emit("merge", undefined, "select a node");
+        else if (this.isCurrentNode(n)) this.emit("merge", n, "cannot merge @ into itself");
+        else this.emit("merge", n);
         break;
       }
       case "p": {
         const n = selectedNode();
-        if (n?.manifest && !this.isCurrentNode(n)) this._resolve({ action: "pick", node: n });
+        if (!n?.manifest) this.emit("pick", undefined, "select a node");
+        else if (this.isCurrentNode(n)) this.emit("pick", n, "cannot pick @ into itself");
+        else this.emit("pick", n);
         break;
       }
       case "u":
-        this._resolve({ action: "undo" });
+        this.emit("undo");
         break;
+      case "a": {
+        const n = selectedNode();
+        if (!n?.manifest || n.manifest.kind !== "auto") {
+          this.emit("auto-keep", n, "select an auto node");
+        } else this.emit("auto-keep", n);
+        break;
+      }
+      case "A": {
+        const n = selectedNode();
+        if (!n?.manifest || n.manifest.kind !== "auto") {
+          this.emit("auto-replace", n, "select an auto node");
+        } else this.emit("auto-replace", n);
+        break;
+      }
+      case "S": {
+        const n = selectedNode();
+        if (!n?.manifest || n.manifest.kind !== "auto") {
+          this.emit("auto-split", n, "select an auto node");
+        } else this.emit("auto-split", n);
+        break;
+      }
+      case "r":
+        this.emit("realign", selectedNode());
+        break;
+      case "y":
+        this.emit("sync-push");
+        break;
+      case "Y":
+        this.emit("sync-pull");
+        break;
+      case "d":
+        this.emit("dashboard");
+        break;
+      case "n": {
+        const n = selectedNode();
+        if (!n?.manifest) this.emit("pin", undefined, "select a node");
+        else this.emit("pin", n);
+        break;
+      }
       case "q":
       case "\x1b":
-        this._resolve({ action: "close" });
+        this.emit("close");
         break;
     }
   }

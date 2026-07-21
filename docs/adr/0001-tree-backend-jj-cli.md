@@ -1,6 +1,6 @@
 # Tree 后端：TS 编排 + jj CLI，git-backed 存储，Rust 后置
 
-项目树（checkpoint DAG）的存储引擎选 jj，但**不引入 Rust**：扩展内定义 `TreeBackend` 接口，v1 实现为 shell out 到 `jj` CLI；tree repo 用 `jj git init`（git-backed，非 colocate）。
+项目树（checkpoint DAG）的存储引擎选 jj，但**不引入 Rust**：扩展内定义 `TreeBackend` 接口，当前实现 shell out 到 `jj` CLI；tree repo 用 `jj git init`（git-backed，非 colocate）。
 
 理由：
 
@@ -10,3 +10,5 @@
 - **git-backed 存储**使物理层为普通 git objects：任何后端（CLI、未来的 jj-lib/git2-rs）均可读写，后端选型从一次性赌注变为可换实现；且 Phase 3 sync 直接获得 git remote 通道。
 
 若未来 profiling 证明 CLI 是瓶颈，按同一 `TreeBackend` 接口做 sidecar（stdio NDJSON）替换，不用 napi（避免 Node ABI 与 prebuild 矩阵）。
+
+ADR-0004 补充 `operationId` / `op restore`、bookmark 读写、amend/describe 更新 draft Node 与 frontier 节点；这些能力仍全部经 CLI shell-out。

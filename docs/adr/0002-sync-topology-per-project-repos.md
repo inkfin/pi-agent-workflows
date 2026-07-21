@@ -9,3 +9,5 @@
 - 同步保持显式 push/pull（人或 agent 通过命令触发），无后台自动同步。
 - 项目可声明 `registry: false` 退出中心注册，应对"元数据也不许出本机"的场景。
 - cherry-pick 语义推广为：把任意机器、任意项目的 turn 注入当前对话（context-inject），不要求本机存在源项目。
+
+ADR-0004 细化：每 origin 独立 bookmark `grove/origins/<originId>`；push 前建 frontier 覆盖本机 heads；Registry 最终一致 + outbox；同步默认关闭。

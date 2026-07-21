@@ -4,7 +4,7 @@
 
 核心原因是数据模型主干倒置，而非 git vs jj 的表象差异：
 
-- Entire 以代码 git history 为主干，session 附在 commit 上；checkpoint **必须有文件改动**才产生。grove 以对话 DAG 为主干，代码状态是节点属性，纯对话探索（fork/merge/命名检查点）也是一等节点。
+- Entire 以代码 git history 为主干，checkpoint 由 Git commit 驱动并与 commit 关联。grove 以对话 DAG 为主干，代码状态只是节点属性，纯对话探索（fork/context merge/命名检查点）也是一等节点。
 - Entire 没有对话树概念：无 (session, entryId) 节点、无 fork 边、无对话级 merge/cherry-pick；checkpoint 是分支上的扁平记录。
 - 无 jj 语义（change-id / op log / `jj undo` / revsets 全部缺失）。
 - 由 git hooks 自动捕获驱动，面向 agent 无关的插件协议；grove 需要 pi 进程内的显式交互操作与 TUI。

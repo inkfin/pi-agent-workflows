@@ -1,13 +1,7 @@
 /**
- * grove/backend/jj-cli.ts — TreeBackend implementation via jj CLI (ADR-0001)
+ * grove/backend/jj-cli.ts — TreeBackend via jj CLI (ADR-0001 + ADR-0004)
  *
- * Verified against jj 0.43:
- * - `jj git init <dir>` (git-backed storage)
- * - `jj new [parents...]` / `jj describe -m <json>` / `jj edit <changeid>`
- * - `jj log --no-graph -T <template with \x1f separators>`
- * - `jj file show -r <rev> <path>` / `jj undo`
- *
- * All operations are serialized through an in-process queue (naive concurrency).
+ * Verified against jj 0.43. All ops serialized through an in-process queue.
  */
 
 import { execFile } from "node:child_process";
@@ -19,6 +13,7 @@ import {
   type TreeBackend,
   type GroveNode,
   type CommitNodeOpts,
+  type AmendNodeOpts,
 } from "./types";
 
 const SEP = "\x1f";
@@ -54,7 +49,6 @@ export class JjCliBackend implements TreeBackend {
     return path.join(this.cwd, this.relDir);
   }
 
-  /** Serialize repo operations (naive concurrency model). */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.queue.then(fn);
     this.queue = p.catch(() => {});
@@ -81,7 +75,6 @@ export class JjCliBackend implements TreeBackend {
     });
   }
 
-  /** Check jj availability and minimum version. Throws JjUnavailableError. */
   static async checkAvailability(): Promise<string> {
     return new Promise((resolve, reject) => {
       execFile("jj", ["--version"], (err, stdout) => {
@@ -104,11 +97,8 @@ export class JjCliBackend implements TreeBackend {
     if (fs.existsSync(path.join(dir, ".jj"))) return dir;
     fs.mkdirSync(path.dirname(dir), { recursive: true });
     await this.run(["git", "init", "--no-colocate", this.relDir], { cwd: this.cwd });
-    // Local identity so nodes can be created/pushed without global jj config.
     await this.run(["config", "set", "--repo", "user.name", "grove"]);
     await this.run(["config", "set", "--repo", "user.email", "grove@local"]);
-    // Turn the initial empty commit into the tree's root node so every
-    // real node hangs off a labeled genesis point.
     await this.run([
       "describe",
       "-m",
@@ -116,17 +106,21 @@ export class JjCliBackend implements TreeBackend {
         v: 1,
         kind: "root",
         label: "root",
-        sessionRef: "",
-        entryId: null,
+        projectId: "",
+        sessionId: "",
+        snapshotId: null,
+        anchor: { entryId: null },
+        lifecycle: "pinned",
         project: { name: "" },
         origin: "",
         createdAt: new Date().toISOString(),
       }),
     ]);
-    // Keep the working copy clean: legacy state.json and OS noise stay
-    // out of tree history.
-    fs.writeFileSync(path.join(dir, ".gitignore"), "state.json\n.DS_Store\n");
-    await this.run(["st"]); // snapshot the .gitignore
+    fs.writeFileSync(
+      path.join(dir, ".gitignore"),
+      ["state.json", ".DS_Store", "journal/", "alignment.json", "outbox/"].join("\n") + "\n",
+    );
+    await this.run(["st"]);
     return dir;
   }
 
@@ -141,7 +135,7 @@ export class JjCliBackend implements TreeBackend {
         if (!line) continue;
         const [changeId, commitId, description, parentsRaw, timestamp] = line.split(SEP);
         if (!changeId || !commitId) continue;
-        if (/^0+$/.test(commitId)) continue; // jj virtual root
+        if (/^0+$/.test(commitId)) continue;
         nodes.push({
           changeId,
           commitId,
@@ -159,29 +153,43 @@ export class JjCliBackend implements TreeBackend {
     return out.trim();
   }
 
+  async currentOperationId(): Promise<string> {
+    const out = await this.run(["op", "log", "--limit", "1", "-T", 'self.id() ++ "\n"']);
+    return out.trim().split("\n")[0] ?? "";
+  }
+
+  private writeFiles(files: Record<string, string> | undefined): void {
+    if (!files) return;
+    for (const [rel, content] of Object.entries(files)) {
+      const fp = path.join(this.repoDir(), rel);
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, content);
+    }
+  }
+
   async commitNode(opts: CommitNodeOpts): Promise<GroveNode> {
     return this.enqueue(async () => {
       await this.ensureRepo();
       const parents = opts.parents?.length ? opts.parents : [await this.currentChangeId()];
-
-      // 1. Create a fresh change on the parents.
       await this.run(["new", ...parents]);
-
-      // 2. Write files into the working copy (snapshotted by the next jj command).
-      if (opts.files) {
-        for (const [rel, content] of Object.entries(opts.files)) {
-          const fp = path.join(this.repoDir(), rel);
-          fs.mkdirSync(path.dirname(fp), { recursive: true });
-          fs.writeFileSync(fp, content);
-        }
-      }
-
-      // 3. Describe: stores the manifest and snapshots the files in one step.
+      this.writeFiles(opts.files);
       await this.run(["describe", "-m", encodeManifest(opts.manifest)]);
-
       const nodes = await this.nodeFromLog("@");
       const node = nodes[0];
       if (!node) throw new Error("grove: failed to read back committed node");
+      return node;
+    });
+  }
+
+  async amendNode(opts: AmendNodeOpts): Promise<GroveNode> {
+    return this.enqueue(async () => {
+      await this.ensureRepo();
+      await this.run(["edit", opts.changeId]);
+      this.writeFiles(opts.files);
+      await this.run(["describe", "-m", encodeManifest(opts.manifest)]);
+      const nodes = await this.nodeFromLog("@");
+      const node = nodes[0];
+      if (!node) throw new Error("grove: failed to read back amended node");
       return node;
     });
   }
@@ -208,6 +216,63 @@ export class JjCliBackend implements TreeBackend {
   async undo(): Promise<void> {
     return this.enqueue(async () => {
       await this.run(["undo"]);
+    });
+  }
+
+  async restoreOperation(opId: string): Promise<void> {
+    return this.enqueue(async () => {
+      await this.run(["op", "restore", opId]);
+    });
+  }
+
+  async setBookmark(name: string, changeId: string): Promise<void> {
+    return this.enqueue(async () => {
+      // create-or-set: try set, fall back to create
+      try {
+        await this.run(["bookmark", "set", name, "-r", changeId]);
+      } catch {
+        await this.run(["bookmark", "create", name, "-r", changeId]);
+      }
+    });
+  }
+
+  async listBookmarks(): Promise<Array<{ name: string; changeId: string }>> {
+    await this.ensureRepo();
+    const out = await this.run([
+      "bookmark",
+      "list",
+      "-T",
+      `name ++ "${SEP}" ++ normal_target.change_id() ++ "\\n"`,
+    ]);
+    const result: Array<{ name: string; changeId: string }> = [];
+    for (const line of out.split("\n")) {
+      if (!line) continue;
+      const [name, changeId] = line.split(SEP);
+      if (name && changeId) result.push({ name, changeId });
+    }
+    return result;
+  }
+
+  async ensureRemote(name: string, url: string): Promise<void> {
+    return this.enqueue(async () => {
+      await this.ensureRepo();
+      try {
+        await this.run(["git", "remote", "add", name, url]);
+      } catch {
+        await this.run(["git", "remote", "set-url", name, url]);
+      }
+    });
+  }
+
+  async gitPush(opts: { remote: string; bookmark: string }): Promise<void> {
+    return this.enqueue(async () => {
+      await this.run(["git", "push", "--remote", opts.remote, "--bookmark", opts.bookmark]);
+    });
+  }
+
+  async gitFetch(opts: { remote: string }): Promise<void> {
+    return this.enqueue(async () => {
+      await this.run(["git", "fetch", "--remote", opts.remote]);
     });
   }
 }
