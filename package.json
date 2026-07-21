@@ -1,20 +1,23 @@
 {
   "name": "pi-agent-workflow",
   "version": "0.1.0",
-  "description": "Personal pi agent workflow: commands, project tree, and session sync",
+  "description": "Personal pi agent workflow: commands, orchestrator, grove session tree",
   "keywords": [
     "pi-package"
   ],
   "scripts": {
-    "test": "node tests/grove-e2e.mjs"
+    "test": "node tests/grove-e2e.mjs && node tests/orchestrator-e2e.mjs",
+    "test:coverage": "c8 --all --check-coverage --lines 60 --functions 70 --branches 55 --reporter=text --reporter=json-summary --include='.pi/extensions/orchestrator/**/*.ts' node tests/orchestrator-e2e.mjs"
   },
   "pi": {
     "extensions": [
       ".pi/extensions/commands",
+      ".pi/extensions/orchestrator",
       ".pi/extensions/grove"
     ]
   },
   "devDependencies": {
+    "c8": "^12.0.0",
     "jiti": "^2.7.0"
   }
 }

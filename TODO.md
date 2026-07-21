@@ -3,7 +3,21 @@
 ## Phase 1：常用命令（先用上）
 
 ### 1.1–1.7
-- [x] 见 git history（commands 层已完成）
+- [x] 见 git history（commands 层已完成；`/plan` 已移交 orchestrator）
+
+---
+
+## Phase 1.5：Orchestrator（Ask → Plan → Build）
+
+> 架构：ADR-0005。前台模型对话/规划；worker 为 `pi --mode json` 子进程。
+
+- [x] orchestrator extension + 配置 + 内置 scout/worker/reviewer/tester
+- [x] 自主 Ask/Plan；Build 仅用户确认（面板 / `/build`）
+- [x] `submit_plan` 结构化 ExecutionPlan + revision + openQuestions
+- [x] `dispatch_research` 并行只读；Build 时 DAG 调度
+- [x] 修改任务 git worktree 隔离；聚合为未提交改动；冲突不污染主工作区
+- [x] 计划面板 + `/orchestrator` fallback
+- [x] `tests/orchestrator-e2e.mjs` 纳入 `npm test`；`test:coverage` 设最低阈值
 
 ---
 
@@ -14,7 +28,7 @@
 > **交接快照（2026-07-21）**
 > - **状态**：manifest v1 + coordinator + SessionAnchor + CAS snapshots + harness auto + 全功能 UI + sync/registry 骨架完成。
 > - **兼容策略**：首个发布前直接演进并 squash v1；发布后 v1 冻结为兼容边界。
-> - **验证**：`npm test`（manifest v1 端到端与单元检查）。
+> - **验证**：`npm test`（grove + orchestrator）。
 > - **已知坑**：
 >   1. jj `description.first_line()` 取单行 JSON
 >   2. fork 必须经 pending `forkFrom` intent，禁止猜父
@@ -34,7 +48,7 @@
 - [x] 全功能 UI 键位与命令对等（goto/commit/fork/merge/pick/undo/auto/realign/sync/dashboard/pin）
 - [x] sync：per-origin bookmark + frontier；privacy gate；`/grove sync config|push|pull`
 - [x] registry：本地 catalog + outbox + dashboard
-- [x] 测试 27 项覆盖
+- [x] 测试覆盖
 
 ---
 
@@ -53,3 +67,4 @@
 - [ ] manifest 的 code 字段从只读指针升级
 - [ ] checkpoint 联动代码提交（可选）
 - [ ] jj 作为项目 VCS 时拓扑对齐
+- [ ] orchestrator Build 成功后可选 `/grove commit` 联动

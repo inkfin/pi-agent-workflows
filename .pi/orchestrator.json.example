@@ -1,0 +1,7 @@
+{
+  "foregroundThinking": "high",
+  "maxParallel": 4,
+  "maxTasks": 8,
+  "taskTimeoutMs": 900000,
+  "agentScope": "both"
+}

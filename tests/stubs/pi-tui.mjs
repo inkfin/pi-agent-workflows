@@ -15,3 +15,6 @@ export class Container {
 export class Text {}
 export class Spacer {}
 export const CURSOR_MARKER = "";
+export const Key = {
+  ctrlAlt(key) { return `ctrl-alt-${key}`; },
+};

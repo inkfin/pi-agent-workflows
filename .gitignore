@@ -1,3 +1,5 @@
 .pi/tree/
 .pi/grove.local.json
+.pi/orchestrator.local.json
+coverage/
 node_modules/

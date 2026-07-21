@@ -1,0 +1,81 @@
+/**
+ * orchestrator/lib/safe-commands.ts — read-only bash allowlist for Ask/Plan
+ */
+
+const DESTRUCTIVE_PATTERNS = [
+  /\brm\b/i,
+  /\brmdir\b/i,
+  /\bmv\b/i,
+  /\bcp\b/i,
+  /\bmkdir\b/i,
+  /\btouch\b/i,
+  /\bchmod\b/i,
+  /\bchown\b/i,
+  /\bchgrp\b/i,
+  /\bln\b/i,
+  /\btee\b/i,
+  /\btruncate\b/i,
+  /\bdd\b/i,
+  /\bshred\b/i,
+  /(^|[^<])>(?!>)/,
+  />>/,
+  /\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
+  /\byarn\s+(add|remove|install|publish)/i,
+  /\bpnpm\s+(add|remove|install|publish)/i,
+  /\bpip\s+(install|uninstall)/i,
+  /\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone|worktree)/i,
+  /\bsudo\b/i,
+  /\bkill\b/i,
+  /\bpkill\b/i,
+  /\bkillall\b/i,
+  /\b(vim?|nano|emacs|code|subl)\b/i,
+];
+
+const SAFE_PATTERNS = [
+  /^\s*cat\b/,
+  /^\s*head\b/,
+  /^\s*tail\b/,
+  /^\s*less\b/,
+  /^\s*more\b/,
+  /^\s*grep\b/,
+  /^\s*find\b/,
+  /^\s*ls\b/,
+  /^\s*pwd\b/,
+  /^\s*echo\b/,
+  /^\s*printf\b/,
+  /^\s*wc\b/,
+  /^\s*sort\b/,
+  /^\s*uniq\b/,
+  /^\s*diff\b/,
+  /^\s*file\b/,
+  /^\s*stat\b/,
+  /^\s*du\b/,
+  /^\s*df\b/,
+  /^\s*tree\b/,
+  /^\s*which\b/,
+  /^\s*type\b/,
+  /^\s*env\b/,
+  /^\s*printenv\b/,
+  /^\s*uname\b/,
+  /^\s*whoami\b/,
+  /^\s*id\b/,
+  /^\s*date\b/,
+  /^\s*ps\b/,
+  /^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get|ls-)/i,
+  /^\s*npm\s+(list|ls|view|info|search|outdated|audit|test|run\s+(test|check|typecheck|lint))\b/i,
+  /^\s*node\s+--version/i,
+  /^\s*python\s+--version/i,
+  /^\s*curl\s/i,
+  /^\s*jq\b/,
+  /^\s*sed\s+-n/i,
+  /^\s*awk\b/,
+  /^\s*rg\b/,
+  /^\s*fd\b/,
+  /^\s*bat\b/,
+];
+
+export function isSafeCommand(command: string): boolean {
+  const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
+  const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+  return !isDestructive && isSafe;
+}

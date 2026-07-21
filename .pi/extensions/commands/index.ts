@@ -2,15 +2,15 @@
  * commands/index.ts — Pi extension: common workflow commands
  *
  * Registers:
- *   /plan       — Generate implementation plan
  *   /review     — Code review
  *   /commit     — Generate/apply commit message
  *   /todo       — Project task management
  *   /context    — View/edit project context files
+ *
+ * Note: /plan is owned by the orchestrator extension (Ask → Plan → Build).
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { registerPlanCommand } from "./plan";
 import { registerReviewCommand } from "./review";
 import { registerCommitCommand } from "./commit";
 import { registerTodoCommand } from "./todo";
@@ -38,7 +38,6 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  registerPlanCommand(register);
   registerReviewCommand(register);
   registerCommitCommand(register);
   registerTodoCommand(register);
